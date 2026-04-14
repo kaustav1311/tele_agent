@@ -104,21 +104,15 @@ def get_streak_days(ticker: str, conn) -> int:
     Uses the latest day-ending group and counts consecutive days back.
     """
     query = """
-    WITH daily AS (
-        SELECT date(datetime(timestamp, 'unixepoch'), 'localtime') as et_day
-        FROM signals WHERE ticker = ?
-        GROUP BY et_day
-    ),
-    numbered AS (
+    WITH numbered AS (
         SELECT et_day,
-               CAST(julianday(et_day) AS INTEGER) - ROW_NUMBER() OVER (ORDER BY et_day DESC) as grp
-        FROM daily
+               julianday(et_day) - ROW_NUMBER() OVER (ORDER BY et_day DESC) as grp
+        FROM daily_signal_summary WHERE ticker = ?
     )
     SELECT COUNT(*) as streak FROM numbered
     WHERE grp = (SELECT grp FROM numbered ORDER BY et_day DESC LIMIT 1)
     """
-    cursor = conn.execute(query, (ticker,))
-    row = cursor.fetchone()
+    row = conn.execute(query, (ticker,)).fetchone()
     return row["streak"] if row else 0
 
 
@@ -175,8 +169,7 @@ def signals_prev_day():
     Get signal summary for the previous ET calendar day.
 
     Returns a list of tickers that had signals on prev_et_day, sorted by
-    abs(move_vs_first_pct) descending. Includes first/last call details,
-    streak calculation, and PnL signal.
+    max_boost descending. Includes first call details and streak calculation.
     """
     try:
         conn = _get_conn()
@@ -198,97 +191,42 @@ def signals_prev_day():
             for summary in summary_rows:
                 ticker = summary["ticker"]
 
-                # Fetch first and last signal records by message_id
+                # Fetch first signal record by message_id
                 cursor = conn.execute(
                     "SELECT * FROM signals WHERE message_id = ?",
                     (summary["first_message_id"],)
                 )
                 first_row = cursor.fetchone()
 
-                cursor = conn.execute(
-                    "SELECT * FROM signals WHERE message_id = ?",
-                    (summary["last_message_id"],)
-                )
-                last_row = cursor.fetchone()
-
-                if not first_row or not last_row:
-                    # Skip if message records are missing
+                if not first_row:
                     continue
 
-                # Get current price from metrics_cache (null-safe)
-                cursor = conn.execute(
-                    "SELECT price FROM metrics_cache WHERE ticker = ?",
-                    (ticker,)
-                )
-                cache_row = cursor.fetchone()
-                current_price = float(cache_row["price"]) if cache_row else 0.0
-
-                # Calculate streak days
-                streak = get_streak_days(ticker, conn)
-
-                # Parse timestamps to ET time strings
+                # Parse timestamp to ET time string
                 first_ts = _parse_ts(first_row["timestamp"])
-                last_ts = _parse_ts(last_row["timestamp"])
                 first_time_et = first_ts.astimezone(ET).strftime("%H:%M") if first_ts else None
-                last_time_et = last_ts.astimezone(ET).strftime("%H:%M") if last_ts else None
 
                 first_price = float(first_row["price_at_signal"])
-                last_price = float(last_row["price_at_signal"])
                 first_activity = first_row["activity_type"]
-
-                # Calculate price deltas (percent)
-                price_delta_intraday_pct = (
-                    (last_price - first_price) / first_price * 100
-                    if first_price else 0.0
-                )
-                move_vs_first_pct = (
-                    (current_price - first_price) / first_price * 100
-                    if first_price else 0.0
-                )
-                move_vs_last_pct = (
-                    (current_price - last_price) / last_price * 100
-                    if last_price else 0.0
-                )
-
-                # PnL signal logic based on first activity and move_vs_first_pct
-                if first_activity == "BUY" and move_vs_first_pct > 1.0:
-                    pnl_signal = "WIN"
-                elif first_activity == "BUY" and move_vs_first_pct < -1.0:
-                    pnl_signal = "LOSS"
-                elif first_activity == "SELL" and move_vs_first_pct < -1.0:
-                    pnl_signal = "WIN"
-                elif first_activity == "SELL" and move_vs_first_pct > 1.0:
-                    pnl_signal = "LOSS"
-                else:
-                    pnl_signal = "NEUTRAL"
 
                 item = {
                     "ticker": ticker,
-                    "streak_days": streak,
+                    "et_day": prev_et_day,
                     "call_count": summary["signal_count"],
+                    "streak_days": get_streak_days(ticker, conn),
+                    "max_boost": summary["max_boost"],
                     "first_call": {
                         "time_et": first_time_et,
                         "price": first_price,
                         "activity_type": first_activity,
+                        "activity_raw": first_row["activity_raw"],
                         "boost": first_row["boost"]
-                    },
-                    "last_call": {
-                        "time_et": last_time_et,
-                        "price": last_price,
-                        "activity_type": last_row["activity_type"],
-                        "boost": last_row["boost"]
-                    },
-                    "price_delta_intraday_pct": round(price_delta_intraday_pct, 1),
-                    "current_price": current_price,
-                    "move_vs_first_pct": round(move_vs_first_pct, 1),
-                    "move_vs_last_pct": round(move_vs_last_pct, 1),
-                    "pnl_signal": pnl_signal
+                    }
                 }
 
                 result.append(item)
 
-            # Sort by abs(move_vs_first_pct) descending
-            result.sort(key=lambda x: abs(x["move_vs_first_pct"]), reverse=True)
+            # Sort by max_boost descending
+            result.sort(key=lambda x: x["max_boost"], reverse=True)
 
             return result
 

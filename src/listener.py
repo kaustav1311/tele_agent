@@ -121,15 +121,22 @@ def _handle_message(session, engine, msg_id: int, timestamp: datetime, text: str
 # Backfill: pull missed messages since last known message_id
 # ---------------------------------------------------------------------------
 
+
+
+
 async def backfill(client: TelegramClient, session, engine, channel):
-    min_id = _get_max_message_id(session)
+    db_max = _get_max_message_id(session)
+    env_min = int(os.environ.get("BACKFILL_MIN_ID", "0"))
+    min_id = max(db_max, env_min)
     if min_id > 0:
         logger.info(f"Resuming from message_id {min_id}")
     else:
         logger.info("Full backfill — no prior messages found")
-
+     # DEBUG
+    test = await client.get_messages(channel, limit=3)
+    logger.info(f"DEBUG test fetch: {[m.id for m in test]}")
     count = 0
-    async for msg in client.iter_messages(channel, min_id=min_id, limit=0):
+    async for msg in client.iter_messages(channel, min_id=min_id, limit=None):
         _handle_message(
             session,
             engine,
@@ -159,7 +166,7 @@ async def main():
 
     async with TelegramClient(str(SESSION_FILE), API_ID, API_HASH) as client:
         await client.get_dialogs()                          # warm entity cache
-        channel = await client.get_entity(CHANNEL_ID)
+        channel = await client.get_input_entity(CHANNEL_ID)
 
         # Backfill missed messages before going live
         await backfill(client, session, engine, channel)

@@ -371,3 +371,60 @@ def analytics_pair_correlation(
     except Exception as e:
         traceback.print_exc()
         return {"pairs": []}
+
+
+@router.get("/analytics/dataset-info")
+def dataset_info():
+    """
+    Returns metadata about the signals dataset:
+    - total_signals: total count of signals
+    - unique_tickers: count of distinct tickers
+    - first_signal_at_utc: earliest signal timestamp (UTC)
+    - last_signal_at_utc: latest signal timestamp (UTC)
+    - first_signal_at_ist: earliest signal timestamp (IST)
+    - last_signal_at_ist: latest signal timestamp (IST)
+    """
+    try:
+        conn = _get_conn()
+        try:
+            query = """
+            SELECT
+                COUNT(*) as total_signals,
+                COUNT(DISTINCT ticker) as unique_tickers,
+                MIN(timestamp) as first_timestamp,
+                MAX(timestamp) as last_timestamp
+            FROM signals
+            """
+            cursor = conn.execute(query)
+            row = cursor.fetchone()
+
+            if not row:
+                return {
+                    "total_signals": 0,
+                    "unique_tickers": 0,
+                    "first_signal_at_utc": None,
+                    "last_signal_at_utc": None,
+                    "first_signal_at_ist": None,
+                    "last_signal_at_ist": None,
+                }
+
+            first_ts = _parse_ts(row["first_timestamp"])
+            last_ts = _parse_ts(row["last_timestamp"])
+
+            IST = ZoneInfo("Asia/Kolkata")
+
+            return {
+                "total_signals": row["total_signals"],
+                "unique_tickers": row["unique_tickers"],
+                "first_signal_at_utc": first_ts.isoformat() if first_ts else None,
+                "last_signal_at_utc": last_ts.isoformat() if last_ts else None,
+                "first_signal_at_ist": first_ts.astimezone(IST).isoformat() if first_ts else None,
+                "last_signal_at_ist": last_ts.astimezone(IST).isoformat() if last_ts else None,
+            }
+
+        finally:
+            conn.close()
+
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
