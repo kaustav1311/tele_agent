@@ -168,67 +168,69 @@ def signals_prev_day():
     """
     Get signal summary for the previous ET calendar day.
 
-    Returns a list of tickers that had signals on prev_et_day, sorted by
-    max_boost descending. Includes first call details and streak calculation.
+    Returns an envelope with summary stats and a sorted ticker list.
+    Response shape:
+    {
+        "et_day": "2026-04-13",
+        "total_tickers": 12,
+        "buy_tickers": 8,
+        "sell_tickers": 4,
+        "total_calls": 31,
+        "tickers": [...]
+    }
     """
     try:
         conn = _get_conn()
         try:
-            # Get current ET date and compute prev_et_day
-            now_et = datetime.now(ET)
-            today_et = now_et.date()
-            prev_et_day = (today_et - timedelta(days=1)).isoformat()
+            # ET-correct date computation
+            prev_et_day = (datetime.now(ET).date() - timedelta(days=1)).isoformat()
 
             # Query daily_signal_summary for prev_et_day
-            cursor = conn.execute(
+            summary_rows = conn.execute(
                 "SELECT * FROM daily_signal_summary WHERE et_day = ?",
                 (prev_et_day,)
-            )
-            summary_rows = cursor.fetchall()
+            ).fetchall()
 
-            result = []
+            # Summary stats — computed entirely from daily_signal_summary
+            buy_tickers = sum(1 for r in summary_rows if r["first_activity"] == "BUY")
+            sell_tickers = sum(1 for r in summary_rows if r["first_activity"] == "SELL")
+            total_calls = sum(r["signal_count"] for r in summary_rows)
 
+            tickers = []
             for summary in summary_rows:
                 ticker = summary["ticker"]
 
-                # Fetch first signal record by message_id
-                cursor = conn.execute(
-                    "SELECT * FROM signals WHERE message_id = ?",
+                # Only fetch signal for activity_raw (not available in summary)
+                first_row = conn.execute(
+                    "SELECT activity_raw, boost FROM signals WHERE message_id = ?",
                     (summary["first_message_id"],)
-                )
-                first_row = cursor.fetchone()
+                ).fetchone()
 
-                if not first_row:
-                    continue
-
-                # Parse timestamp to ET time string
-                first_ts = _parse_ts(first_row["timestamp"])
-                first_time_et = first_ts.astimezone(ET).strftime("%H:%M") if first_ts else None
-
-                first_price = float(first_row["price_at_signal"])
-                first_activity = first_row["activity_type"]
-
-                item = {
+                tickers.append({
                     "ticker": ticker,
-                    "et_day": prev_et_day,
                     "call_count": summary["signal_count"],
                     "streak_days": get_streak_days(ticker, conn),
                     "max_boost": summary["max_boost"],
                     "first_call": {
-                        "time_et": first_time_et,
-                        "price": first_price,
-                        "activity_type": first_activity,
-                        "activity_raw": first_row["activity_raw"],
-                        "boost": first_row["boost"]
+                        "time_et": summary["first_time_et"],
+                        "price": summary["first_price"],
+                        "activity_type": summary["first_activity"],
+                        "activity_raw": first_row["activity_raw"] if first_row else None,
+                        "boost": first_row["boost"] if first_row else None,
                     }
-                }
-
-                result.append(item)
+                })
 
             # Sort by max_boost descending
-            result.sort(key=lambda x: x["max_boost"], reverse=True)
+            tickers.sort(key=lambda x: (x["max_boost"] or 0), reverse=True)
 
-            return result
+            return {
+                "et_day": prev_et_day,
+                "total_tickers": len(summary_rows),
+                "buy_tickers": buy_tickers,
+                "sell_tickers": sell_tickers,
+                "total_calls": total_calls,
+                "tickers": tickers,
+            }
 
         finally:
             conn.close()
