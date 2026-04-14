@@ -19,7 +19,6 @@ CHANNEL_ID   = int(os.environ["TG_CHANNEL_ID"])
 SESSION_FILE = Path(__file__).parent.parent / "session"   # → E:\Telethon\session.session
 
 RAW_OUTPUT   = Path(__file__).parent.parent / "data" / "raw_messages.json"
-MAX_MESSAGES = 500
 HOURS_BACK   = 4
 
 
@@ -44,8 +43,8 @@ async def fetch(min_id: int) -> list[dict]:
       
       async for msg in client.iter_messages(
           channel,
-          limit=MAX_MESSAGES,
           min_id=min_id,
+          limit=0,
       ):
             if msg.date < cutoff:
                 break            # messages arrive newest-first; stop at horizon

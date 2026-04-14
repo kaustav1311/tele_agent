@@ -13,7 +13,7 @@ from sqlmodel import text
 load_dotenv()
 
 from src.schema import get_engine
-from src.api.routes import signals, health, metrics
+from src.api.routes import signals, health, metrics, analytics
 
 
 # ---------------------------------------------------------------------------
@@ -75,3 +75,4 @@ async def auth_middleware(request: Request, call_next):
 app.include_router(signals.router)
 app.include_router(health.router)
 app.include_router(metrics.router)
+app.include_router(analytics.router)

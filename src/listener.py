@@ -14,7 +14,7 @@ from sqlmodel import select
 from telethon import TelegramClient, events
 
 from src.parser import parse, ParserError
-from src.schema import Signal, UnparsedMessage, get_engine, get_session
+from src.schema import Signal, UnparsedMessage, get_engine, get_session, rebuild_daily_summary, upsert_daily_summary_for
 
 load_dotenv()
 
@@ -25,9 +25,6 @@ API_HASH     = os.environ["TG_API_HASH"]
 CHANNEL_ID   = int(os.environ["TG_CHANNEL_ID"])
 SESSION_FILE = Path(__file__).parent.parent / "session"
 DB_PATH      = Path(__file__).parent.parent / "data" / "signals.db"
-
-BACKFILL_LIMIT = 500
-
 
 # ---------------------------------------------------------------------------
 # DB helpers
@@ -44,8 +41,9 @@ def _get_max_message_id(session) -> int:
     return max(sig_max or 0, unp_max or 0)
 
 
-def _store_signal(session, parsed: dict, meta: dict):
-    """Write a parsed signal to DB. Skips if message_id already exists."""
+def _store_signal(session, engine, parsed: dict, meta: dict):
+    """Write a parsed signal to DB. Skips if message_id already exists.
+    After successful insert, updates daily_signal_summary for this signal."""
     existing = session.get(Signal, meta["message_id"])
     if existing:
         return
@@ -60,6 +58,10 @@ def _store_signal(session, parsed: dict, meta: dict):
         session.add(signal)
         session.commit()
         logger.info(f"Stored signal {meta['message_id']} | {parsed['ticker']} | {parsed['activity_type']}")
+
+        # Update daily_signal_summary for this signal
+        upsert_daily_summary_for(engine, signal)
+
     except Exception as e:
         session.rollback()
         logger.error(f"DB write failed for signal {meta['message_id']}: {e}")
@@ -91,7 +93,7 @@ def _store_unparsed(session, meta: dict, reason: str):
 # Message handler (shared by backfill + live listener)
 # ---------------------------------------------------------------------------
 
-def _handle_message(session, msg_id: int, timestamp: datetime, text: str,
+def _handle_message(session, engine, msg_id: int, timestamp: datetime, text: str,
                     has_media: bool, sender_id: int):
     meta = {
         "message_id": msg_id,
@@ -107,7 +109,7 @@ def _handle_message(session, msg_id: int, timestamp: datetime, text: str,
 
     try:
         parsed = parse(text, has_media=has_media)
-        _store_signal(session, parsed, meta)
+        _store_signal(session, engine, parsed, meta)
     except ParserError as e:
         _store_unparsed(session, meta, reason=e.reason)
     except Exception as e:
@@ -119,14 +121,18 @@ def _handle_message(session, msg_id: int, timestamp: datetime, text: str,
 # Backfill: pull missed messages since last known message_id
 # ---------------------------------------------------------------------------
 
-async def backfill(client: TelegramClient, session, channel):
+async def backfill(client: TelegramClient, session, engine, channel):
     min_id = _get_max_message_id(session)
-    logger.info(f"Backfill starting from message_id > {min_id}")
+    if min_id > 0:
+        logger.info(f"Resuming from message_id {min_id}")
+    else:
+        logger.info("Full backfill — no prior messages found")
 
     count = 0
-    async for msg in client.iter_messages(channel, limit=BACKFILL_LIMIT, min_id=min_id):
+    async for msg in client.iter_messages(channel, min_id=min_id, limit=0):
         _handle_message(
             session,
+            engine,
             msg_id     = msg.id,
             timestamp  = msg.date,
             text       = msg.text or "",
@@ -156,7 +162,11 @@ async def main():
         channel = await client.get_entity(CHANNEL_ID)
 
         # Backfill missed messages before going live
-        await backfill(client, session, channel)
+        await backfill(client, session, engine, channel)
+
+        # Rebuild daily_signal_summary from all signals
+        summary_rows = rebuild_daily_summary(engine)
+        logger.info(f"daily_signal_summary rebuilt: {summary_rows} rows")
 
         # Live listener — fires on every new message in channel
         @client.on(events.NewMessage(chats=channel))
@@ -164,6 +174,7 @@ async def main():
             msg = event.message
             _handle_message(
                 session,
+                engine,
                 msg_id    = msg.id,
                 timestamp = msg.date,
                 text      = msg.text or "",
