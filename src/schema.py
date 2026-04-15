@@ -139,12 +139,12 @@ class DailyCall(SQLModel, table=True):
     # First call anchor
     first_call_msg_id:          int     = Field()                      # FK → signals.message_id
     first_call_price:           Optional[float] = Field(default=None)
-    first_call_time_et:         Optional[str]   = Field(default=None)  # HH:MM:SS
+    first_call_time_et:         Optional[str]   = Field(default=None)  # HH:MM
 
     # Last call anchor
     last_call_msg_id:           int     = Field()                      # FK → signals.message_id
     last_call_price:            Optional[float] = Field(default=None)
-    last_call_time_et:          Optional[str]   = Field(default=None)  # HH:MM:SS
+    last_call_time_et:          Optional[str]   = Field(default=None)  # HH:MM
 
     # Day aggregates
     call_count:                 int     = Field(default=1)
@@ -194,6 +194,68 @@ def _get_et_time(timestamp: datetime) -> str:
     et_tz = ZoneInfo("America/New_York")
     et_dt = timestamp.astimezone(et_tz)
     return et_dt.strftime("%H:%M")
+
+
+def rebuild_daily_calls(engine) -> int:
+    """
+    Delete all rows from daily_calls and re-aggregate from scratch.
+    Creates one row per (ticker, et_day, activity_type) with first/last call metrics.
+    Returns the number of rows inserted.
+    """
+    session = Session(engine)
+    try:
+        # Delete all existing rows
+        session.exec(sql_text("DELETE FROM daily_calls"))
+        session.commit()
+
+        # Fetch all signals, grouped by (ticker, et_day, activity_type)
+        all_signals = session.exec(select(Signal).order_by(Signal.timestamp)).all()
+
+        # Group by (ticker, et_day, activity_type)
+        groups = {}
+        for sig in all_signals:
+            et_day = _get_et_day(sig.timestamp)
+            key = (sig.ticker, et_day, sig.activity_type)
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(sig)
+
+        # Create a daily_calls row for each group
+        daily_calls_rows = []
+        for (ticker, et_day, activity_type), signals in groups.items():
+            # Signals are already sorted by timestamp
+            first_sig = signals[0]
+            last_sig = signals[-1]
+
+            daily_call = DailyCall(
+                ticker=ticker,
+                et_day=et_day,
+                activity_type=activity_type,
+                first_call_msg_id=first_sig.message_id,
+                first_call_price=first_sig.price_at_signal,
+                first_call_time_et=_get_et_time(first_sig.timestamp),
+                last_call_msg_id=last_sig.message_id,
+                last_call_price=last_sig.price_at_signal,
+                last_call_time_et=_get_et_time(last_sig.timestamp),
+                call_count=len(signals),
+                max_boost=max((s.boost for s in signals if s.boost is not None), default=None),
+                dq_first_price_missing=(1 if first_sig.price_at_signal is None else 0),
+                dq_last_price_missing=(1 if last_sig.price_at_signal is None else 0),
+                dq_eod_missing=1,
+                dq_mcap_missing=0,
+            )
+            daily_calls_rows.append(daily_call)
+
+        # Bulk insert
+        for dc_row in daily_calls_rows:
+            session.add(dc_row)
+        session.commit()
+
+        row_count = len(daily_calls_rows)
+        return row_count
+
+    finally:
+        session.close()
 
 
 def rebuild_daily_summary(engine) -> int:
@@ -303,6 +365,79 @@ def upsert_daily_summary_for(engine, signal: Signal) -> None:
 
         # Use INSERT OR REPLACE (upsert)
         session.merge(summary)
+        session.commit()
+
+    finally:
+        session.close()
+
+
+def upsert_daily_calls_for(engine, signal: Signal) -> None:
+    """
+    After a new signal is inserted, upsert the daily_calls row for (ticker, et_day, activity_type).
+    Re-calculates all fields (first/last prices, times, call_count, max_boost) by querying
+    only that slice from signals.
+
+    daily_calls is per-(ticker, et_day, activity_type) and tracks the day's call metrics.
+    """
+    session = Session(engine)
+    try:
+        et_day = _get_et_day(signal.timestamp)
+        ticker = signal.ticker
+        activity_type = signal.activity_type
+
+        # Fetch all signals for this (ticker, et_day, activity_type)
+        same_type_signals = session.exec(
+            select(Signal)
+            .where(Signal.ticker == ticker)
+            .where(Signal.activity_type == activity_type)
+            .order_by(Signal.timestamp)
+        ).all()
+
+        # Filter to only this et_day
+        same_day_signals = [
+            s for s in same_type_signals
+            if _get_et_day(s.timestamp) == et_day
+        ]
+
+        if not same_day_signals:
+            # Should not happen, but be safe
+            return
+
+        # Find first and last by timestamp
+        first_sig = min(same_day_signals, key=lambda s: s.timestamp)
+        last_sig = max(same_day_signals, key=lambda s: s.timestamp)
+
+        # Recalculate daily_calls fields
+        daily_call = DailyCall(
+            ticker=ticker,
+            et_day=et_day,
+            activity_type=activity_type,
+            first_call_msg_id=first_sig.message_id,
+            first_call_price=first_sig.price_at_signal,
+            first_call_time_et=_get_et_time(first_sig.timestamp),
+            last_call_msg_id=last_sig.message_id,
+            last_call_price=last_sig.price_at_signal,
+            last_call_time_et=_get_et_time(last_sig.timestamp),
+            call_count=len(same_day_signals),
+            max_boost=max((s.boost for s in same_day_signals if s.boost is not None), default=None),
+            # Blocked fields (set to null/default):
+            eod_price=None,
+            eod_fetched_at=None,
+            mcap_at_call=None,
+            mcap_tier=None,
+            first_call_efficiency_pct=None,
+            last_call_efficiency_pct=None,
+            intraday_drift_pct=None,
+            avg_trade_hours=None,
+            direction_correct=None,
+            dq_first_price_missing=(1 if first_sig.price_at_signal is None else 0),
+            dq_last_price_missing=(1 if last_sig.price_at_signal is None else 0),
+            dq_eod_missing=1,  # always starts as 1 until EOD backfill
+            dq_mcap_missing=0,
+        )
+
+        # Use INSERT OR REPLACE (upsert) on unique (ticker, et_day, activity_type)
+        session.merge(daily_call)
         session.commit()
 
     finally:

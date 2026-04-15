@@ -14,7 +14,7 @@ from sqlmodel import select
 from telethon import TelegramClient, events
 
 from src.parser import parse, ParserError
-from src.schema import Signal, UnparsedMessage, get_engine, get_session, rebuild_daily_summary, upsert_daily_summary_for
+from src.schema import Signal, UnparsedMessage, get_engine, get_session, rebuild_daily_summary, rebuild_daily_calls, upsert_daily_summary_for, upsert_daily_calls_for
 
 load_dotenv()
 
@@ -59,8 +59,9 @@ def _store_signal(session, engine, parsed: dict, meta: dict):
         session.commit()
         logger.info(f"Stored signal {meta['message_id']} | {parsed['ticker']} | {parsed['activity_type']}")
 
-        # Update daily_signal_summary for this signal
+        # Update daily_signal_summary and daily_calls for this signal
         upsert_daily_summary_for(engine, signal)
+        upsert_daily_calls_for(engine, signal)
 
     except Exception as e:
         session.rollback()
@@ -174,6 +175,10 @@ async def main():
         # Rebuild daily_signal_summary from all signals
         summary_rows = rebuild_daily_summary(engine)
         logger.info(f"daily_signal_summary rebuilt: {summary_rows} rows")
+
+        # Rebuild daily_calls from all signals
+        calls_rows = rebuild_daily_calls(engine)
+        logger.info(f"daily_calls rebuilt: {calls_rows} rows")
 
         # Live listener — fires on every new message in channel
         @client.on(events.NewMessage(chats=channel))
