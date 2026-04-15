@@ -54,6 +54,7 @@ def _format_signal(row, has_conflicting_activity: bool = False) -> dict:
     """Convert a named-column sqlite3.Row to API response dict."""
     ts_utc = _parse_ts(row["timestamp"])
     created_at = _parse_ts(row["created_at"])
+    first_call_ts_utc = _parse_ts(row["first_call_time_utc"])
 
     return {
         "message_id":               row["message_id"],
@@ -73,9 +74,9 @@ def _format_signal(row, has_conflicting_activity: bool = False) -> dict:
         "call_count":               row["call_count"],
         "has_conflicting_activity": has_conflicting_activity,
         "first_call_price":         row["first_call_price"],
-        "last_call_price":          row["last_call_price"],
-        "first_call_time_et":       row["first_call_time_et"],
-        "last_call_time_et":        row["last_call_time_et"],
+        "last_call_price":          row["price_at_signal"],  # latest signal in window
+        "first_call_time_et":       first_call_ts_utc.astimezone(ET).strftime("%H:%M") if first_call_ts_utc else None,
+        "last_call_time_et":        ts_utc.astimezone(ET).strftime("%H:%M") if ts_utc else None,
     }
 
 
@@ -86,6 +87,17 @@ SQL = """
             ROW_NUMBER() OVER (PARTITION BY s.ticker, s.activity_type ORDER BY s.timestamp DESC) as rn
         FROM signals s
         WHERE s.timestamp >= ?
+    ),
+    first_calls AS (
+        SELECT ticker, activity_type, timestamp as first_call_timestamp, price_at_signal as first_call_price
+        FROM (
+            SELECT
+                s.ticker, s.activity_type, s.timestamp, s.price_at_signal,
+                ROW_NUMBER() OVER (PARTITION BY s.ticker, s.activity_type ORDER BY s.timestamp ASC) as rn
+            FROM signals s
+            WHERE s.timestamp >= ?
+        )
+        WHERE rn = 1
     )
     SELECT
         rs.message_id, rs.ticker, rs.pair,
@@ -97,14 +109,11 @@ SQL = """
          WHERE ticker = rs.ticker
          AND activity_type = rs.activity_type
          AND timestamp >= ?) AS call_count,
-        dc.first_call_price,
-        dc.last_call_price,
-        dc.first_call_time_et,
-        dc.last_call_time_et
+        fc.first_call_price,
+        fc.first_call_timestamp as first_call_time_utc
     FROM ranked_signals rs
-    LEFT JOIN daily_calls dc ON dc.ticker = rs.ticker
-        AND dc.activity_type = rs.activity_type
-        AND dc.et_day = ?
+    LEFT JOIN first_calls fc ON fc.ticker = rs.ticker
+        AND fc.activity_type = rs.activity_type
     WHERE rs.rn = 1
     ORDER BY rs.boost DESC, rs.timestamp DESC
 """
@@ -134,7 +143,6 @@ def signals_summary():
         from src.api.utils.candles import get_candle_start
 
         now_utc = datetime.now(timezone.utc)
-        today_et_day = datetime.now(ET).date().isoformat()
         candle_starts = {tf: get_candle_start(tf) for tf in TIMEFRAMES}
 
         conn = _get_conn()
@@ -142,7 +150,7 @@ def signals_summary():
             windows = {}
             for tf in TIMEFRAMES:
                 candle_start_str = candle_starts[tf].strftime("%Y-%m-%d %H:%M:%S")
-                cursor = conn.execute(SQL, (candle_start_str, candle_start_str, today_et_day))
+                cursor = conn.execute(SQL, (candle_start_str, candle_start_str, candle_start_str))
                 rows = cursor.fetchall()
 
                 # Build set of tickers that have both BUY and SELL in this timeframe
