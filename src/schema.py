@@ -258,6 +258,85 @@ def rebuild_daily_calls(engine) -> int:
         session.close()
 
 
+def backfill_missing_daily_calls(engine) -> int:
+    """
+    Inserts daily_calls rows for any (ticker, et_day, activity_type) combinations
+    that exist in signals but have no corresponding daily_calls row.
+    Safe to run at any time — only inserts missing rows, never overwrites.
+    Returns count of rows inserted.
+    """
+    session = Session(engine)
+    try:
+        # Find all (ticker, et_day, activity_type) groups in signals
+        all_signals = session.exec(
+            select(Signal)
+            .where(Signal.activity_type.in_(["BUY", "SELL"]))
+            .order_by(Signal.timestamp)
+        ).all()
+
+        # Group by (ticker, et_day, activity_type)
+        groups: dict = {}
+        for sig in all_signals:
+            et_day = _get_et_day(sig.timestamp)
+            key = (sig.ticker, et_day, sig.activity_type)
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(sig)
+
+        # Check which groups are missing from daily_calls
+        existing = session.exec(
+            sql_text("SELECT ticker, et_day, activity_type FROM daily_calls")
+        ).all()
+        existing_keys = {(r[0], r[1], r[2]) for r in existing}
+
+        inserted = 0
+        for (ticker, et_day, activity_type), signals in groups.items():
+            if (ticker, et_day, activity_type) in existing_keys:
+                continue  # already exists, skip
+
+            first_sig = signals[0]
+            last_sig = signals[-1]
+
+            daily_call = DailyCall(
+                ticker=ticker,
+                et_day=et_day,
+                activity_type=activity_type,
+                first_call_msg_id=first_sig.message_id,
+                first_call_price=first_sig.price_at_signal,
+                first_call_time_et=_get_et_time(first_sig.timestamp),
+                last_call_msg_id=last_sig.message_id,
+                last_call_price=last_sig.price_at_signal,
+                last_call_time_et=_get_et_time(last_sig.timestamp),
+                call_count=len(signals),
+                max_boost=max(
+                    (s.boost for s in signals if s.boost is not None), default=None
+                ),
+                intraday_drift_pct=(
+                    round(
+                        (last_sig.price_at_signal - first_sig.price_at_signal)
+                        / first_sig.price_at_signal * 100,
+                        4,
+                    )
+                    if first_sig.price_at_signal
+                    and last_sig.price_at_signal
+                    and first_sig.price_at_signal != 0
+                    else None
+                ),
+                dq_first_price_missing=(1 if first_sig.price_at_signal is None else 0),
+                dq_last_price_missing=(1 if last_sig.price_at_signal is None else 0),
+                dq_eod_missing=1,
+                dq_mcap_missing=0,
+            )
+            session.add(daily_call)
+            inserted += 1
+
+        session.commit()
+        return inserted
+
+    finally:
+        session.close()
+
+
 def rebuild_daily_summary(engine) -> int:
     """
     Delete all rows from daily_signal_summary and re-aggregate from scratch.

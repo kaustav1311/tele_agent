@@ -14,7 +14,17 @@ from sqlmodel import select
 from telethon import TelegramClient, events
 
 from src.parser import parse, ParserError
-from src.schema import Signal, UnparsedMessage, get_engine, get_session, rebuild_daily_summary, rebuild_daily_calls, upsert_daily_summary_for, upsert_daily_calls_for
+from src.schema import (
+    Signal,
+    UnparsedMessage,
+    get_engine,
+    get_session,
+    rebuild_daily_summary,
+    rebuild_daily_calls,
+    backfill_missing_daily_calls,
+    upsert_daily_summary_for,
+    upsert_daily_calls_for,
+)
 
 load_dotenv()
 
@@ -179,6 +189,10 @@ async def main():
         # Rebuild daily_calls from all signals
         calls_rows = rebuild_daily_calls(engine)
         logger.info(f"daily_calls rebuilt: {calls_rows} rows")
+
+        # Fill any gaps — catches days where listener was not running
+        gap_rows = backfill_missing_daily_calls(engine)
+        logger.info(f"daily_calls gap fill: {gap_rows} new rows inserted")
 
         # Live listener — fires on every new message in channel
         @client.on(events.NewMessage(chats=channel))
