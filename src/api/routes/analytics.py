@@ -1,11 +1,11 @@
 # src/api/routes/analytics.py
-# Analytics endpoints — heatmap, cap-windows, pair-correlation.
+# Analytics endpoints — heatmap/hourly, windows/4h, filters.
 
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, HTTPException
 from sqlalchemy import text
 import os
 import sqlite3
@@ -63,199 +63,247 @@ def _get_4h_window(hour: int) -> str:
     return f"{window_start:02d}-{window_end:02d}"
 
 
-@router.get("/analytics/heatmap")
-def analytics_heatmap():
+@router.get("/analytics/heatmap/hourly")
+def analytics_heatmap_hourly(
+    range: str = Query("7d"),
+    mcap_tier: str = Query("all"),
+):
     """
-    Returns signal frequency and avg boost by hour-of-day (ET), broken down
-    by activity_type. Always returns 24 hours (0-23), with zeros for empty hours.
+    Returns signal count per ET hour (0–23) aggregated over a date range,
+    optionally filtered by MCap tier.
+
+    Query parameters:
+    - range: "1d" (today) | "7d" (last 7 days, default) | "all" (full DB history)
+    - mcap_tier: "micro" | "small" | "mid" | "large" | "unknown" | "all" (default)
+
+    Response includes 24 hourly buckets with buy/sell split and avg boost.
     """
     try:
+        if range not in ("1d", "7d", "all"):
+            range = "7d"
+
+        if mcap_tier not in ("micro", "small", "mid", "large", "unknown", "all"):
+            mcap_tier = "all"
+
         conn = _get_conn()
         try:
-            # Fetch all signals with timestamp and activity_type
-            cursor = conn.execute(
-                "SELECT timestamp, activity_type, boost FROM signals ORDER BY timestamp"
-            )
+            # Compute range_start in UTC
+            now_et = datetime.now(ET)
+            if range == "1d":
+                range_start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+            elif range == "7d":
+                range_start_et = (now_et - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+            else:  # "all"
+                range_start = datetime.min.replace(tzinfo=timezone.utc)
+                range_start = range_start.isoformat()
+
+            if range != "all":
+                range_start = range_start_et.astimezone(timezone.utc).isoformat()
+
+            # Build query with optional mcap_tier filter
+            if mcap_tier == "all":
+                sql = """
+                    SELECT
+                        CAST(strftime('%H', datetime(s.timestamp, '-4 hours')) AS INTEGER) as hour_et,
+                        COUNT(*) as count,
+                        SUM(CASE WHEN s.activity_type='BUY'  THEN 1 ELSE 0 END) as buy_count,
+                        SUM(CASE WHEN s.activity_type='SELL' THEN 1 ELSE 0 END) as sell_count,
+                        ROUND(AVG(CASE WHEN s.boost IS NOT NULL THEN s.boost ELSE 0 END), 2) as avg_boost
+                    FROM signals s
+                    WHERE s.timestamp >= ?
+                    GROUP BY hour_et
+                    ORDER BY hour_et
+                """
+                params = (range_start,)
+            else:
+                sql = """
+                    SELECT
+                        CAST(strftime('%H', datetime(s.timestamp, '-4 hours')) AS INTEGER) as hour_et,
+                        COUNT(*) as count,
+                        SUM(CASE WHEN s.activity_type='BUY'  THEN 1 ELSE 0 END) as buy_count,
+                        SUM(CASE WHEN s.activity_type='SELL' THEN 1 ELSE 0 END) as sell_count,
+                        ROUND(AVG(CASE WHEN s.boost IS NOT NULL THEN s.boost ELSE 0 END), 2) as avg_boost
+                    FROM signals s
+                    LEFT JOIN daily_calls dc ON dc.ticker = s.ticker
+                        AND dc.et_day = DATE(datetime(s.timestamp, '-4 hours'))
+                        AND dc.activity_type = s.activity_type
+                    WHERE s.timestamp >= ? AND dc.mcap_tier = ?
+                    GROUP BY hour_et
+                    ORDER BY hour_et
+                """
+                params = (range_start, mcap_tier)
+
+            cursor = conn.execute(sql, params)
             rows = cursor.fetchall()
 
             # Initialize 24-hour buckets
-            buckets = {}
+            hours = []
+            hour_map = {row["hour_et"]: row for row in rows}
+
             for hour in range(24):
-                buckets[hour] = {
-                    "hour_et": hour,
-                    "total_signals": 0,
-                    "avg_boost": 0.0,
-                    "buy_count": 0,
-                    "sell_count": 0,
-                    "unknown_count": 0,
-                    "dominant_activity": None,
-                }
-
-            # Aggregate signals into buckets
-            boost_sum = defaultdict(float)
-            boost_count = defaultdict(int)
-
-            for row in rows:
-                ts_utc = _parse_ts(row["timestamp"])
-                if not ts_utc:
-                    continue
-
-                hour = _get_et_hour(ts_utc)
-                activity = row["activity_type"] or "UNKNOWN"
-                boost = row["boost"]
-
-                buckets[hour]["total_signals"] += 1
-
-                if activity == "BUY":
-                    buckets[hour]["buy_count"] += 1
-                elif activity == "SELL":
-                    buckets[hour]["sell_count"] += 1
+                if hour in hour_map:
+                    r = hour_map[hour]
+                    hours.append({
+                        "hour_et": hour,
+                        "count": r["count"],
+                        "buy_count": r["buy_count"],
+                        "sell_count": r["sell_count"],
+                        "avg_boost": r["avg_boost"],
+                    })
                 else:
-                    buckets[hour]["unknown_count"] += 1
+                    hours.append({
+                        "hour_et": hour,
+                        "count": 0,
+                        "buy_count": 0,
+                        "sell_count": 0,
+                        "avg_boost": None,
+                    })
 
-                if boost is not None:
-                    boost_sum[hour] += boost
-                    boost_count[hour] += 1
+            # Compute dataset_days and total stats
+            stats_sql = """
+                SELECT
+                    COUNT(DISTINCT DATE(datetime(s.timestamp, '-4 hours'))) as dataset_days,
+                    COUNT(*) as total_signals,
+                    COUNT(DISTINCT s.ticker) as unique_tickers
+                FROM signals s
+                WHERE s.timestamp >= ?
+            """
 
-            # Calculate averages and dominant activity
-            for hour in range(24):
-                if boost_count[hour] > 0:
-                    buckets[hour]["avg_boost"] = round(boost_sum[hour] / boost_count[hour], 2)
+            if mcap_tier != "all":
+                stats_sql = """
+                    SELECT
+                        COUNT(DISTINCT DATE(datetime(s.timestamp, '-4 hours'))) as dataset_days,
+                        COUNT(*) as total_signals,
+                        COUNT(DISTINCT s.ticker) as unique_tickers
+                    FROM signals s
+                    LEFT JOIN daily_calls dc ON dc.ticker = s.ticker
+                        AND dc.et_day = DATE(datetime(s.timestamp, '-4 hours'))
+                        AND dc.activity_type = s.activity_type
+                    WHERE s.timestamp >= ? AND dc.mcap_tier = ?
+                """
 
-                counts = [
-                    ("BUY", buckets[hour]["buy_count"]),
-                    ("SELL", buckets[hour]["sell_count"]),
-                    ("UNKNOWN", buckets[hour]["unknown_count"]),
-                ]
-                max_count = max(counts, key=lambda x: x[1])
-                if max_count[1] > 0:
-                    buckets[hour]["dominant_activity"] = max_count[0]
+            stats_row = conn.execute(
+                stats_sql,
+                params if mcap_tier != "all" else (range_start,)
+            ).fetchone()
 
-            hours = [buckets[h] for h in range(24)]
-            return {"hours": hours}
+            return {
+                "range": range,
+                "mcap_tier": mcap_tier,
+                "dataset_days": stats_row["dataset_days"] if stats_row else 0,
+                "total_signals": stats_row["total_signals"] if stats_row else 0,
+                "unique_tickers": stats_row["unique_tickers"] if stats_row else 0,
+                "hours": hours,
+            }
 
         finally:
             conn.close()
 
     except Exception as e:
         traceback.print_exc()
-        return {"hours": []}
+        raise HTTPException(status_code=500, detail=f"Analytics heatmap error: {str(e)}")
 
 
-@router.get("/analytics/cap-windows")
-def analytics_cap_windows(
-    cap_tier: str = Query("all"),
-    days: int = Query(30, ge=1, le=90),
+@router.get("/analytics/windows/4h")
+def analytics_windows_4h(
+    mcap_tier: str = Query("all"),
 ):
     """
-    Analyzes which 4-hour ET windows perform best by market cap tier.
-    Returns 6 windows with signal stats.
+    Returns per-4H-window aggregates of signal volume and boost.
+    Performance metrics (win_rate, avg_return_pct) are currently blocked pending EOD price backfill.
+
+    Query parameters:
+    - mcap_tier: "micro" | "small" | "mid" | "large" | "unknown" | "all" (default)
+
+    Response includes 6 windows (00-04, 04-08, etc.) with volume metrics.
+    Performance fields (win_rate, avg_return_pct) return null with pending_backfill=true.
     """
     try:
-        if cap_tier not in ["small", "mid", "large", "all"]:
-            cap_tier = "all"
+        if mcap_tier not in ("micro", "small", "mid", "large", "unknown", "all"):
+            mcap_tier = "all"
 
         conn = _get_conn()
         try:
-            cutoff_time = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-
-            # Build the mcap tier classification query
-            if cap_tier == "all":
-                where_clause = "s.timestamp >= ?"
-                params = (cutoff_time,)
-            elif cap_tier == "small":
-                where_clause = "s.timestamp >= ? AND (m.mcap IS NULL OR m.mcap < 500000000)"
-                params = (cutoff_time,)
-            elif cap_tier == "mid":
-                where_clause = "s.timestamp >= ? AND m.mcap >= 500000000 AND m.mcap < 5000000000"
-                params = (cutoff_time,)
-            else:  # large
-                where_clause = "s.timestamp >= ? AND m.mcap >= 5000000000"
-                params = (cutoff_time,)
-
-            sql = f"""
-                SELECT
-                    s.timestamp,
-                    s.activity_type,
-                    s.boost,
-                    s.alerts_tier,
-                    s.ticker,
-                    m.mcap
-                FROM signals s
-                LEFT JOIN metrics_cache m ON s.ticker = m.ticker
-                WHERE {where_clause}
-                ORDER BY s.timestamp
-            """
+            # Query signals for volume metrics (available now)
+            if mcap_tier == "all":
+                sql = """
+                    SELECT
+                        (CAST(strftime('%H', datetime(s.timestamp, '-4 hours')) AS INT) / 4) * 4 as window_start,
+                        COUNT(*) as signal_count,
+                        SUM(CASE WHEN s.activity_type='BUY' THEN 1 ELSE 0 END) as buy_count,
+                        SUM(CASE WHEN s.activity_type='SELL' THEN 1 ELSE 0 END) as sell_count,
+                        ROUND(AVG(CASE WHEN s.boost IS NOT NULL THEN s.boost ELSE 0 END), 2) as avg_boost
+                    FROM signals s
+                    GROUP BY window_start
+                    ORDER BY window_start
+                """
+                params = ()
+            else:
+                sql = """
+                    SELECT
+                        (CAST(strftime('%H', datetime(s.timestamp, '-4 hours')) AS INT) / 4) * 4 as window_start,
+                        COUNT(*) as signal_count,
+                        SUM(CASE WHEN s.activity_type='BUY' THEN 1 ELSE 0 END) as buy_count,
+                        SUM(CASE WHEN s.activity_type='SELL' THEN 1 ELSE 0 END) as sell_count,
+                        ROUND(AVG(CASE WHEN s.boost IS NOT NULL THEN s.boost ELSE 0 END), 2) as avg_boost
+                    FROM signals s
+                    LEFT JOIN daily_calls dc ON dc.ticker = s.ticker
+                        AND dc.et_day = DATE(datetime(s.timestamp, 'localtime', '-4 hours'))
+                        AND dc.activity_type = s.activity_type
+                    WHERE dc.mcap_tier = ?
+                    GROUP BY window_start
+                    ORDER BY window_start
+                """
+                params = (mcap_tier,)
 
             cursor = conn.execute(sql, params)
             rows = cursor.fetchall()
 
-            # Initialize 6 windows
-            windows_data = {}
-            for window_str in ["00-04", "04-08", "08-12", "12-16", "16-20", "20-24"]:
-                windows_data[window_str] = {
-                    "window": window_str,
-                    "signal_count": 0,
-                    "boost_sum": 0.0,
-                    "boost_count": 0,
-                    "hot_fire_count": 0,
-                    "unique_tickers": set(),
-                    "activity_counts": defaultdict(int),
-                }
-
-            # Aggregate signals into windows
+            # Build window data
+            window_counts = {}
             for row in rows:
-                ts_utc = _parse_ts(row["timestamp"])
-                if not ts_utc:
-                    continue
+                window_start = row["window_start"]
+                window_counts[window_start] = row["signal_count"]
 
-                et_dt = ts_utc.astimezone(ET)
-                hour = et_dt.hour
-                window_str = _get_4h_window(hour)
+            # Compute call_volume_multiplier
+            avg_count = sum(window_counts.values()) / 6 if window_counts else 1
+            if avg_count == 0:
+                avg_count = 1
 
-                activity = row["activity_type"] or "UNKNOWN"
-                boost = row["boost"]
-                alerts_tier = row["alerts_tier"]
-                ticker = row["ticker"]
-
-                windows_data[window_str]["signal_count"] += 1
-                windows_data[window_str]["unique_tickers"].add(ticker)
-                windows_data[window_str]["activity_counts"][activity] += 1
-
-                if boost is not None:
-                    windows_data[window_str]["boost_sum"] += boost
-                    windows_data[window_str]["boost_count"] += 1
-
-                if alerts_tier in ("HOT", "FIRE"):
-                    windows_data[window_str]["hot_fire_count"] += 1
-
-            # Finalize stats
+            # Build results
             result_windows = []
-            for window_str in ["00-04", "04-08", "08-12", "12-16", "16-20", "20-24"]:
-                data = windows_data[window_str]
-                avg_boost = 0.0
-                if data["boost_count"] > 0:
-                    avg_boost = round(data["boost_sum"] / data["boost_count"], 2)
+            for window_start in [0, 4, 8, 12, 16, 20]:
+                window_str = f"{window_start:02d}-{window_start+4:02d}"
+                row = next((r for r in rows if r["window_start"] == window_start), None)
 
-                hot_fire_pct = 0.0
-                if data["signal_count"] > 0:
-                    hot_fire_pct = round(100.0 * data["hot_fire_count"] / data["signal_count"], 1)
+                if row:
+                    signal_count = row["signal_count"]
+                    buy_count = row["buy_count"]
+                    sell_count = row["sell_count"]
+                    avg_boost = row["avg_boost"]
+                else:
+                    signal_count = 0
+                    buy_count = 0
+                    sell_count = 0
+                    avg_boost = None
 
-                dominant_activity = "UNKNOWN"
-                if data["activity_counts"]:
-                    dominant_activity = max(data["activity_counts"].items(), key=lambda x: x[1])[0]
+                call_volume_multiplier = signal_count / avg_count if avg_count > 0 else 0
 
                 result_windows.append({
-                    "window": window_str,
-                    "signal_count": data["signal_count"],
+                    "label": window_str,
+                    "hour_start": window_start,
+                    "signal_count": signal_count,
+                    "buy_count": buy_count,
+                    "sell_count": sell_count,
                     "avg_boost": avg_boost,
-                    "hot_fire_pct": hot_fire_pct,
-                    "unique_tickers": len(data["unique_tickers"]),
-                    "dominant_activity": dominant_activity,
+                    "call_volume_multiplier": round(call_volume_multiplier, 2),
+                    "win_rate": None,  # BLOCKED — pending EOD backfill
+                    "avg_return_pct": None,  # BLOCKED — pending EOD backfill
                 })
 
             return {
-                "cap_tier": cap_tier,
+                "mcap_tier": mcap_tier,
+                "pending_backfill": True,  # EOD prices not yet backfilled
                 "windows": result_windows,
             }
 
@@ -264,113 +312,48 @@ def analytics_cap_windows(
 
     except Exception as e:
         traceback.print_exc()
-        return {"cap_tier": cap_tier, "windows": []}
+        raise HTTPException(status_code=500, detail=f"Analytics 4h windows error: {str(e)}")
 
 
-@router.get("/analytics/pair-correlation")
-def analytics_pair_correlation(
-    min_co_occurrences: int = Query(3, ge=1),
-    days: int = Query(30, ge=1, le=90),
-):
+@router.get("/analytics/filters")
+def analytics_filters():
     """
-    Finds ticker pairs that are frequently signaled within the same 4H ET window
-    on the same day, suggesting correlation.
+    Returns distinct filter option lists for Analytics widgets.
+    Prevents hardcoding filter values in frontend.
+
+    Response includes:
+    - mcap_tiers: distinct non-null mcap_tier values from daily_calls
+    - dataset_start_et, dataset_end_et: earliest/latest et_day in daily_calls
+    - total_days: count of distinct et_day in daily_calls
     """
     try:
         conn = _get_conn()
         try:
-            cutoff_time = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            # Get distinct mcap_tiers
+            tiers_cursor = conn.execute(
+                "SELECT DISTINCT mcap_tier FROM daily_calls WHERE mcap_tier IS NOT NULL ORDER BY mcap_tier"
+            )
+            mcap_tiers = [row["mcap_tier"] for row in tiers_cursor.fetchall()]
 
-            # Fetch all signals with timestamp and ticker
-            sql = """
-                SELECT timestamp, ticker, activity_type
-                FROM signals
-                WHERE timestamp >= ?
-                ORDER BY timestamp
-            """
-            cursor = conn.execute(sql, (cutoff_time,))
-            rows = cursor.fetchall()
+            # Get dataset date range
+            range_cursor = conn.execute(
+                "SELECT MIN(et_day) as start_day, MAX(et_day) as end_day, COUNT(DISTINCT et_day) as total_days FROM daily_calls"
+            )
+            range_row = range_cursor.fetchone()
 
-            # Build buckets: (et_day, 4h_window) -> list of (ticker, activity_type)
-            bucket_signals = defaultdict(list)
-
-            for row in rows:
-                ts_utc = _parse_ts(row["timestamp"])
-                if not ts_utc:
-                    continue
-
-                et_dt = ts_utc.astimezone(ET)
-                et_day = et_dt.strftime("%Y-%m-%d")
-                hour = et_dt.hour
-                window = _get_4h_window(hour)
-
-                bucket_key = (et_day, window)
-                ticker = row["ticker"]
-                activity = row["activity_type"] or "UNKNOWN"
-
-                bucket_signals[bucket_key].append((ticker, activity))
-
-            # Count co-occurrences and track shared windows
-            co_occur = defaultdict(int)
-            shared_windows = defaultdict(list)
-            activity_matches = defaultdict(int)
-            activity_total = defaultdict(int)
-
-            for bucket_key, tickers_in_bucket in bucket_signals.items():
-                # Remove duplicates per ticker per bucket
-                unique_tickers = list(set(t[0] for t in tickers_in_bucket))
-
-                # For each pair in this bucket, increment co-occurrence
-                for i in range(len(unique_tickers)):
-                    for j in range(i + 1, len(unique_tickers)):
-                        ta = unique_tickers[i]
-                        tb = unique_tickers[j]
-                        pair_key = tuple(sorted([ta, tb]))
-
-                        co_occur[pair_key] += 1
-                        shared_windows[pair_key].append(f"{bucket_key[0]} {bucket_key[1]}")
-
-                        # Check if same activity type
-                        activity_a = next((x[1] for x in tickers_in_bucket if x[0] == ta), None)
-                        activity_b = next((x[1] for x in tickers_in_bucket if x[0] == tb), None)
-
-                        activity_total[pair_key] += 1
-                        if activity_a and activity_b and activity_a == activity_b:
-                            activity_matches[pair_key] += 1
-
-            # Filter by min_co_occurrences and sort
-            result_pairs = []
-            for pair_key, count in co_occur.items():
-                if count >= min_co_occurrences:
-                    same_activity_pct = 0.0
-                    if activity_total[pair_key] > 0:
-                        same_activity_pct = round(
-                            100.0 * activity_matches[pair_key] / activity_total[pair_key],
-                            1
-                        )
-
-                    # Keep last 3 shared windows
-                    windows_list = shared_windows[pair_key][-3:]
-
-                    result_pairs.append({
-                        "ticker_a": pair_key[0],
-                        "ticker_b": pair_key[1],
-                        "co_occurrences": count,
-                        "shared_windows": windows_list,
-                        "same_activity_pct": same_activity_pct,
-                    })
-
-            # Sort by co_occurrences descending
-            result_pairs.sort(key=lambda x: x["co_occurrences"], reverse=True)
-
-            return {"pairs": result_pairs}
+            return {
+                "mcap_tiers": mcap_tiers,
+                "dataset_start_et": range_row["start_day"] if range_row else None,
+                "dataset_end_et": range_row["end_day"] if range_row else None,
+                "total_days": range_row["total_days"] if range_row else 0,
+            }
 
         finally:
             conn.close()
 
     except Exception as e:
         traceback.print_exc()
-        return {"pairs": []}
+        raise HTTPException(status_code=500, detail=f"Analytics filters error: {str(e)}")
 
 
 @router.get("/analytics/dataset-info")

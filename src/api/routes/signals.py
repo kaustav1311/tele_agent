@@ -16,7 +16,7 @@ IST = ZoneInfo("Asia/Kolkata")
 
 router = APIRouter()
 
-TIMEFRAMES = ["15m", "1h", "4h", "daily"]
+TIMEFRAMES = ["5m", "15m", "1h", "4h", "daily", "1hr_rolling"]
 
 
 def _get_conn():
@@ -46,7 +46,6 @@ def _parse_ts(val) -> datetime | None:
 def _format_signal(row, has_conflicting_activity: bool = False) -> dict:
     """Convert a named-column sqlite3.Row to API response dict."""
     ts_utc = _parse_ts(row["timestamp"])
-    fetched_at = _parse_ts(row["metrics_fetched_at"])
     created_at = _parse_ts(row["created_at"])
 
     return {
@@ -66,8 +65,10 @@ def _format_signal(row, has_conflicting_activity: bool = False) -> dict:
         "created_at":               created_at.isoformat() if created_at else None,
         "call_count":               row["call_count"],
         "has_conflicting_activity": has_conflicting_activity,
-        "live_price":               row["live_price"],
-        "metrics_fetched_at":       fetched_at.isoformat() if fetched_at else None,
+        "first_call_price":         row["first_call_price"],
+        "last_call_price":          row["last_call_price"],
+        "first_call_time_et":       row["first_call_time_et"],
+        "last_call_time_et":        row["last_call_time_et"],
     }
 
 
@@ -89,10 +90,14 @@ SQL = """
          WHERE ticker = rs.ticker
          AND activity_type = rs.activity_type
          AND timestamp >= ?) AS call_count,
-        m.price         AS live_price,
-        m.fetched_at    AS metrics_fetched_at
+        dc.first_call_price,
+        dc.last_call_price,
+        dc.first_call_time_et,
+        dc.last_call_time_et
     FROM ranked_signals rs
-    LEFT JOIN metrics_cache m ON m.ticker = rs.ticker
+    LEFT JOIN daily_calls dc ON dc.ticker = rs.ticker
+        AND dc.activity_type = rs.activity_type
+        AND dc.et_day = ?
     WHERE rs.rn = 1
     ORDER BY rs.boost DESC, rs.timestamp DESC
 """
@@ -122,6 +127,7 @@ def signals_summary():
         from src.api.utils.candles import get_candle_start
 
         now_utc = datetime.now(timezone.utc)
+        today_et_day = datetime.now(ET).date().isoformat()
         candle_starts = {tf: get_candle_start(tf) for tf in TIMEFRAMES}
 
         conn = _get_conn()
@@ -129,7 +135,7 @@ def signals_summary():
             windows = {}
             for tf in TIMEFRAMES:
                 candle_start_str = candle_starts[tf].strftime("%Y-%m-%d %H:%M:%S")
-                cursor = conn.execute(SQL, (candle_start_str, candle_start_str))
+                cursor = conn.execute(SQL, (candle_start_str, candle_start_str, today_et_day))
                 rows = cursor.fetchall()
 
                 # Build set of tickers that have both BUY and SELL in this timeframe
@@ -141,12 +147,17 @@ def signals_summary():
                         activity_types_by_ticker[ticker] = set()
                     activity_types_by_ticker[ticker].add(activity)
 
-                # Format signals with conflicting_activity flag
+                # Format signals with conflicting_activity flag and streak_days
                 formatted_rows = []
+                streak_cache = {}
                 for r in rows:
                     ticker = r["ticker"]
                     has_conflict = len(activity_types_by_ticker[ticker]) > 1
-                    formatted_rows.append(_format_signal(r, has_conflicting_activity=has_conflict))
+                    if ticker not in streak_cache:
+                        streak_cache[ticker] = get_streak_days(ticker, conn)
+                    formatted = _format_signal(r, has_conflicting_activity=has_conflict)
+                    formatted["streak_days"] = streak_cache[ticker]
+                    formatted_rows.append(formatted)
 
                 windows[tf] = formatted_rows
         finally:
@@ -164,18 +175,31 @@ def signals_summary():
 
 
 @router.get("/signals/prev-day")
-def signals_prev_day():
+def signals_prev_day(
+    sort: str = "avg_boost",
+    activity_type: str = "ALL",
+    boost_min: int | None = None,
+):
     """
-    Get signal summary for the previous ET calendar day.
+    Get signal summary for the previous ET calendar day, sourced from daily_calls.
 
-    Returns an envelope with summary stats and a sorted ticker list.
+    Returns per-(ticker × activity_type) rows with call prices, timing, and performance metrics.
+
+    Query parameters:
+    - sort: "avg_boost" (default) | "first_call_time" | "call_count" | "intraday_drift"
+    - activity_type: "BUY" | "SELL" | "ALL" (default)
+    - boost_min: Optional. Filter rows where max_boost >= boost_min
+
     Response shape:
     {
         "et_day": "2026-04-13",
-        "total_tickers": 12,
-        "buy_tickers": 8,
-        "sell_tickers": 4,
-        "total_calls": 31,
+        "summary": {
+            "total_signals": 42,
+            "total_ticker_directions": 12,
+            "buy_tickers": 8,
+            "sell_tickers": 4,
+            "avg_boost_day": 5.8
+        },
         "tickers": [...]
     }
     """
@@ -185,50 +209,130 @@ def signals_prev_day():
             # ET-correct date computation
             prev_et_day = (datetime.now(ET).date() - timedelta(days=1)).isoformat()
 
-            # Query daily_signal_summary for prev_et_day
-            summary_rows = conn.execute(
-                "SELECT * FROM daily_signal_summary WHERE et_day = ?",
-                (prev_et_day,)
+            # Query daily_calls for prev_et_day with optional filters
+            where_clause = "WHERE dc.et_day = ?"
+            params = [prev_et_day]
+
+            if activity_type in ("BUY", "SELL"):
+                where_clause += " AND dc.activity_type = ?"
+                params.append(activity_type)
+
+            if boost_min is not None:
+                where_clause += " AND dc.max_boost >= ?"
+                params.append(boost_min)
+
+            daily_calls_rows = conn.execute(
+                f"""
+                SELECT
+                    dc.ticker, dc.activity_type, dc.call_count, dc.max_boost,
+                    dc.first_call_price, dc.last_call_price,
+                    dc.first_call_time_et, dc.last_call_time_et,
+                    dc.intraday_drift_pct,
+                    dc.direction_correct,
+                    dc.first_call_efficiency_pct,
+                    dc.last_call_efficiency_pct,
+                    dc.eod_price,
+                    dc.mcap_tier,
+                    dc.dq_first_price_missing, dc.dq_last_price_missing, dc.dq_eod_missing
+                FROM daily_calls dc
+                {where_clause}
+                """
+                , params
             ).fetchall()
 
-            # Summary stats — computed entirely from daily_signal_summary
-            buy_tickers = sum(1 for r in summary_rows if r["first_activity"] == "BUY")
-            sell_tickers = sum(1 for r in summary_rows if r["first_activity"] == "SELL")
-            total_calls = sum(r["signal_count"] for r in summary_rows)
+            # Compute avg_boost per (ticker, activity_type) from signals
+            boost_query_where = "WHERE DATE(datetime(s.timestamp, '-4 hours')) = ?"
+            boost_params = [prev_et_day]
 
+            if activity_type in ("BUY", "SELL"):
+                boost_query_where += " AND s.activity_type = ?"
+                boost_params.append(activity_type)
+
+            avg_boost_rows = conn.execute(
+                f"""
+                SELECT s.ticker, s.activity_type,
+                    ROUND(AVG(s.boost), 2) as avg_boost
+                FROM signals s
+                {boost_query_where}
+                GROUP BY s.ticker, s.activity_type
+                """
+                , boost_params
+            ).fetchall()
+
+            # Build avg_boost lookup
+            avg_boost_map = {}
+            for row in avg_boost_rows:
+                key = (row["ticker"], row["activity_type"])
+                avg_boost_map[key] = row["avg_boost"]
+
+            # Compute header stats
+            total_signals = conn.execute(
+                f"SELECT COUNT(*) as cnt FROM signals s {boost_query_where}",
+                boost_params
+            ).fetchone()["cnt"]
+
+            buy_count = sum(1 for r in daily_calls_rows if r["activity_type"] == "BUY")
+            sell_count = sum(1 for r in daily_calls_rows if r["activity_type"] == "SELL")
+
+            # Calculate avg_boost for day
+            if daily_calls_rows:
+                day_boost_sum = sum(
+                    avg_boost_map.get((r["ticker"], r["activity_type"]), 0)
+                    for r in daily_calls_rows
+                )
+                day_boost_count = len(daily_calls_rows)
+                avg_boost_day = round(day_boost_sum / day_boost_count, 2) if day_boost_count > 0 else 0.0
+            else:
+                avg_boost_day = 0.0
+
+            # Build ticker rows
             tickers = []
-            for summary in summary_rows:
-                ticker = summary["ticker"]
-
-                # Only fetch signal for activity_raw (not available in summary)
-                first_row = conn.execute(
-                    "SELECT activity_raw, boost FROM signals WHERE message_id = ?",
-                    (summary["first_message_id"],)
-                ).fetchone()
+            for dc_row in daily_calls_rows:
+                ticker = dc_row["ticker"]
+                act_type = dc_row["activity_type"]
+                avg_boost = avg_boost_map.get((ticker, act_type), None)
 
                 tickers.append({
                     "ticker": ticker,
-                    "call_count": summary["signal_count"],
-                    "streak_days": get_streak_days(ticker, conn),
-                    "max_boost": summary["max_boost"],
-                    "first_call": {
-                        "time_et": summary["first_time_et"],
-                        "price": summary["first_price"],
-                        "activity_type": summary["first_activity"],
-                        "activity_raw": first_row["activity_raw"] if first_row else None,
-                        "boost": first_row["boost"] if first_row else None,
+                    "activity_type": act_type,
+                    "call_count": dc_row["call_count"],
+                    "avg_boost": avg_boost,
+                    "first_call_price": dc_row["first_call_price"],
+                    "last_call_price": dc_row["last_call_price"],
+                    "first_call_time_et": dc_row["first_call_time_et"],
+                    "last_call_time_et": dc_row["last_call_time_et"],
+                    "intraday_drift_pct": dc_row["intraday_drift_pct"],
+                    "direction_correct": dc_row["direction_correct"],
+                    "first_call_efficiency_pct": dc_row["first_call_efficiency_pct"],
+                    "last_call_efficiency_pct": dc_row["last_call_efficiency_pct"],
+                    "eod_price": dc_row["eod_price"],
+                    "mcap_tier": dc_row["mcap_tier"],
+                    "dq_flags": {
+                        "first_price_missing": bool(dc_row["dq_first_price_missing"]),
+                        "last_price_missing": bool(dc_row["dq_last_price_missing"]),
+                        "eod_missing": bool(dc_row["dq_eod_missing"]),
                     }
                 })
 
-            # Sort by max_boost descending
-            tickers.sort(key=lambda x: (x["max_boost"] or 0), reverse=True)
+            # Apply sorting
+            if sort == "first_call_time":
+                tickers.sort(key=lambda x: x["first_call_time_et"] or "")
+            elif sort == "call_count":
+                tickers.sort(key=lambda x: x["call_count"], reverse=True)
+            elif sort == "intraday_drift":
+                tickers.sort(key=lambda x: abs(x["intraday_drift_pct"] or 0), reverse=True)
+            else:  # avg_boost (default)
+                tickers.sort(key=lambda x: (x["avg_boost"] or 0), reverse=True)
 
             return {
                 "et_day": prev_et_day,
-                "total_tickers": len(summary_rows),
-                "buy_tickers": buy_tickers,
-                "sell_tickers": sell_tickers,
-                "total_calls": total_calls,
+                "summary": {
+                    "total_signals": total_signals,
+                    "total_ticker_directions": len(daily_calls_rows),
+                    "buy_tickers": buy_count,
+                    "sell_tickers": sell_count,
+                    "avg_boost_day": avg_boost_day,
+                },
                 "tickers": tickers,
             }
 

@@ -72,7 +72,7 @@ async def auth_middleware(request: Request, call_next):
 # Routers
 # ---------------------------------------------------------------------------
 
-app.include_router(signals.router)
+app.include_router(signals.router, prefix="/api")
 app.include_router(health.router)
-app.include_router(metrics.router)
-app.include_router(analytics.router)
+app.include_router(metrics.router, prefix="/api")
+app.include_router(analytics.router, prefix="/api")

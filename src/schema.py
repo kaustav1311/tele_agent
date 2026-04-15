@@ -55,21 +55,24 @@ class Signal(SQLModel, table=True):
 
 # ---------------------------------------------------------------------------
 # metrics_cache
-# One row per ticker — CoinGecko enrichment, upserted on manual refresh.
+# MCap + tier lookup table. One row per ticker.
+# Upserted via POST /metrics/refresh (CryptoCompare, fetches MCap only).
+# Role: Provide mcap + mcap_tier for daily_calls enrichment + analytics.
 # ---------------------------------------------------------------------------
 
 class MetricsCache(SQLModel, table=True):
     __tablename__ = "metrics_cache"
 
-    ticker:       str            = Field(primary_key=True)  # e.g. "VIRTUAL"
+    ticker:       str             = Field(primary_key=True)  # e.g. "VIRTUAL"
 
-    price:        Optional[float] = Field(default=None)
-    volume_24h:   Optional[float] = Field(default=None)
-    mcap:         Optional[float] = Field(default=None)
-    rank:         Optional[int]   = Field(default=None)
-    circ_supply:  Optional[float] = Field(default=None)
+    price:        Optional[float] = Field(default=None)      # USD spot price
+    volume_24h:   Optional[float] = Field(default=None)      # 24h volume USD
+    mcap:         Optional[float] = Field(default=None)      # Market cap in USD
+    rank:         Optional[int]   = Field(default=None)      # CoinGecko/CC rank
+    circ_supply:  Optional[float] = Field(default=None)      # circulating supply
+    mcap_tier:    Optional[str]   = Field(default=None)      # "micro"|"small"|"mid"|"large"|"unknown"
 
-    fetched_at:   Optional[datetime] = Field(default=None)  # last successful CoinGecko pull
+    fetched_at:   Optional[datetime] = Field(default=None)   # last successful MCap fetch
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +117,61 @@ class DailySignalSummary(SQLModel, table=True):
 
     signal_count:       int            = Field(default=1)
     max_boost:          Optional[int]  = Field(default=None)
+
+
+# ---------------------------------------------------------------------------
+# daily_calls
+# Per-(ticker, et_day, activity_type) aggregation with pricing and efficiency metrics.
+# Populated by listener as signals arrive, enriched by CoinGecko EOD job.
+# ---------------------------------------------------------------------------
+
+class DailyCall(SQLModel, table=True):
+    __tablename__ = "daily_calls"
+
+    # Primary key (auto-increment) + unique constraint on dimensions
+    id:                         int     = Field(primary_key=True)
+
+    # Dimensions
+    ticker:                     str     = Field(index=True)            # e.g. "VIRTUAL"
+    et_day:                     str     = Field(index=True)            # YYYY-MM-DD in ET
+    activity_type:              str     = Field(index=True)            # "BUY" | "SELL"
+
+    # First call anchor
+    first_call_msg_id:          int     = Field()                      # FK → signals.message_id
+    first_call_price:           Optional[float] = Field(default=None)
+    first_call_time_et:         Optional[str]   = Field(default=None)  # HH:MM:SS
+
+    # Last call anchor
+    last_call_msg_id:           int     = Field()                      # FK → signals.message_id
+    last_call_price:            Optional[float] = Field(default=None)
+    last_call_time_et:          Optional[str]   = Field(default=None)  # HH:MM:SS
+
+    # Day aggregates
+    call_count:                 int     = Field(default=1)
+    max_boost:                  Optional[int]   = Field(default=None)
+
+    # EOD price — fetched separately via CoinGecko, null until filled
+    eod_price:                  Optional[float] = Field(default=None)
+    eod_fetched_at:             Optional[str]   = Field(default=None)  # ISO UTC datetime
+
+    # MCap — snapshotted from metrics_cache at backfill time
+    mcap_at_call:               Optional[float] = Field(default=None)
+    mcap_tier:                  Optional[str]   = Field(default=None)  # "micro" | "small" | "mid" | "large" | "unknown"
+
+    # Computed efficiency (Python fills these after eod_price arrives)
+    first_call_efficiency_pct:  Optional[float] = Field(default=None)  # (eod - first_price) / first_price * 100
+    last_call_efficiency_pct:   Optional[float] = Field(default=None)  # (eod - last_price) / last_price * 100
+    intraday_drift_pct:         Optional[float] = Field(default=None)  # (last_price - first_price) / first_price * 100
+    avg_trade_hours:            Optional[float] = Field(default=None)  # hours from first_call_time_et to 23:59 ET
+    direction_correct:          Optional[int]   = Field(default=None)  # 1 | 0 | NULL (bool, null if eod missing)
+
+    # Data quality flags
+    dq_first_price_missing:     int     = Field(default=0)
+    dq_last_price_missing:      int     = Field(default=0)
+    dq_eod_missing:             int     = Field(default=1)             # starts as 1, cleared when eod fetched
+    dq_mcap_missing:            int     = Field(default=0)
+
+    # Unique constraint enforced at DB level (one row per ticker, day, direction)
 
 
 # ---------------------------------------------------------------------------
