@@ -182,6 +182,15 @@ from sqlmodel import create_engine, Session, select, func
 from sqlalchemy import text as sql_text
 
 
+def _safe_float(val) -> float | None:
+    """Cast val to float; return None if not possible or exactly 0.0."""
+    try:
+        f = float(val)
+        return f if f != 0.0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _get_et_day(timestamp: datetime) -> str:
     """Convert UTC timestamp to ET date string (YYYY-MM-DD)."""
     et_tz = ZoneInfo("America/New_York")
@@ -228,13 +237,14 @@ def rebuild_daily_calls(engine) -> int:
             last_sig = signals[-1]
 
             # Compute intraday_drift_pct
-            intraday_drift_pct = None
-            if (first_sig.price_at_signal and last_sig.price_at_signal and
-                first_sig.price_at_signal != 0):
+            first_price = _safe_float(first_sig.price_at_signal)
+            last_price  = _safe_float(last_sig.price_at_signal)
+            if first_price is not None and last_price is not None:
                 intraday_drift_pct = round(
-                    (last_sig.price_at_signal - first_sig.price_at_signal)
-                    / first_sig.price_at_signal * 100, 2
+                    (last_price - first_price) / first_price * 100, 2
                 )
+            else:
+                intraday_drift_pct = None
 
             daily_call = DailyCall(
                 ticker=ticker,
@@ -506,13 +516,14 @@ def upsert_daily_calls_for(engine, signal: Signal) -> None:
 
         # Recalculate daily_calls fields
         # Compute intraday_drift_pct
-        intraday_drift_pct = None
-        if (first_sig.price_at_signal and last_sig.price_at_signal and
-            first_sig.price_at_signal != 0):
+        first_price = _safe_float(first_sig.price_at_signal)
+        last_price  = _safe_float(last_sig.price_at_signal)
+        if first_price is not None and last_price is not None:
             intraday_drift_pct = round(
-                (last_sig.price_at_signal - first_sig.price_at_signal)
-                / first_sig.price_at_signal * 100, 2
+                (last_price - first_price) / first_price * 100, 2
             )
+        else:
+            intraday_drift_pct = None
 
         if existing:
             # Update existing row
