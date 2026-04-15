@@ -72,16 +72,8 @@ def _store_signal(session, engine, parsed: dict, meta: dict):
         # Update daily_signal_summary (all dates)
         upsert_daily_summary_for(engine, signal)
 
-        # Update daily_calls only for today's signals (live updates)
-        # Past dates are backfill and read-only after day ends
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        from src.schema import _get_et_day
-
-        today_et = _get_et_day(datetime.now(ZoneInfo("America/New_York")))
-        signal_et_day = _get_et_day(signal.timestamp)
-        if signal_et_day == today_et:
-            upsert_daily_calls_for(engine, signal)
+        # Update daily_calls for all signals (idempotent upsert)
+        upsert_daily_calls_for(engine, signal)
 
     except Exception as e:
         session.rollback()

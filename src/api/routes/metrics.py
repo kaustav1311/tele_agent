@@ -22,15 +22,15 @@ def _get_db():
 def _compute_mcap_tier(mcap: float | None) -> str:
     """
     Classify MCap into tiers.
-    - micro: < 100M
-    - small: 100M - 500M
-    - mid: 500M - 5B
-    - large: >= 5B
+    - micro: < $50M
+    - small: $50M - $500M
+    - mid: $500M - $5B
+    - large: >= $5B
     - unknown: null MCap
     """
     if mcap is None:
         return "unknown"
-    if mcap < 100_000_000:
+    if mcap < 50_000_000:
         return "micro"
     elif mcap < 500_000_000:
         return "small"
@@ -158,6 +158,7 @@ def _fetch_mcap_from_cryptocompare(tickers: list) -> dict:
     Returns {ticker: {price, volume_24h, mcap, rank, circ_supply}} or {ticker: None} on failure.
     """
     try:
+        # SECURITY: NEVER prefix with VITE_ — that would expose the key in the Vite bundle at build time.
         api_key = os.environ.get("CRYPTOCOMPARE_API_KEY", "")
         url = "https://min-api.cryptocompare.com/data/pricemultifull"
         params = {

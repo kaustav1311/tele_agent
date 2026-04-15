@@ -16,6 +16,13 @@ IST = ZoneInfo("Asia/Kolkata")
 
 router = APIRouter()
 
+
+def _et_offset() -> str:
+    """Return current UTC-to-ET offset string for SQLite datetime(), e.g. '-4 hours' or '-5 hours'."""
+    secs = int(datetime.now(ET).utcoffset().total_seconds())
+    h = secs // 3600
+    return f"{h} hours"
+
 TIMEFRAMES = ["5m", "15m", "1h", "4h", "daily", "1hr_rolling"]
 
 
@@ -241,8 +248,8 @@ def signals_prev_day(
             ).fetchall()
 
             # Compute avg_boost per (ticker, activity_type) from signals
-            boost_query_where = "WHERE DATE(datetime(s.timestamp, '-4 hours')) = ?"
-            boost_params = [prev_et_day]
+            boost_query_where = "WHERE DATE(datetime(s.timestamp, ?)) = ?"
+            boost_params = [_et_offset(), prev_et_day]
 
             if activity_type in ("BUY", "SELL"):
                 boost_query_where += " AND s.activity_type = ?"

@@ -16,6 +16,13 @@ ET = ZoneInfo("America/New_York")
 router = APIRouter()
 
 
+def _et_offset() -> str:
+    """Return current UTC-to-ET offset string for SQLite datetime(), e.g. '-4 hours' or '-5 hours'."""
+    secs = int(datetime.now(ET).utcoffset().total_seconds())
+    h = secs // 3600
+    return f"{h} hours"
+
+
 def _get_conn():
     """Raw sqlite3 connection for parameterized queries."""
     db_path = os.environ.get("DB_PATH", "data/signals.db")
@@ -104,7 +111,7 @@ def analytics_heatmap_hourly(
             if mcap_tier == "all":
                 sql = """
                     SELECT
-                        CAST(strftime('%H', datetime(s.timestamp, '-4 hours')) AS INTEGER) as hour_et,
+                        CAST(strftime('%H', datetime(s.timestamp, ?)) AS INTEGER) as hour_et,
                         COUNT(*) as count,
                         SUM(CASE WHEN s.activity_type='BUY'  THEN 1 ELSE 0 END) as buy_count,
                         SUM(CASE WHEN s.activity_type='SELL' THEN 1 ELSE 0 END) as sell_count,
@@ -114,24 +121,24 @@ def analytics_heatmap_hourly(
                     GROUP BY hour_et
                     ORDER BY hour_et
                 """
-                params = (range_start,)
+                params = (_et_offset(), range_start)
             else:
                 sql = """
                     SELECT
-                        CAST(strftime('%H', datetime(s.timestamp, '-4 hours')) AS INTEGER) as hour_et,
+                        CAST(strftime('%H', datetime(s.timestamp, ?)) AS INTEGER) as hour_et,
                         COUNT(*) as count,
                         SUM(CASE WHEN s.activity_type='BUY'  THEN 1 ELSE 0 END) as buy_count,
                         SUM(CASE WHEN s.activity_type='SELL' THEN 1 ELSE 0 END) as sell_count,
                         ROUND(AVG(CASE WHEN s.boost IS NOT NULL THEN s.boost ELSE 0 END), 2) as avg_boost
                     FROM signals s
                     LEFT JOIN daily_calls dc ON dc.ticker = s.ticker
-                        AND dc.et_day = DATE(datetime(s.timestamp, '-4 hours'))
+                        AND dc.et_day = DATE(datetime(s.timestamp, ?))
                         AND dc.activity_type = s.activity_type
                     WHERE s.timestamp >= ? AND dc.mcap_tier = ?
                     GROUP BY hour_et
                     ORDER BY hour_et
                 """
-                params = (range_start, mcap_tier)
+                params = (_et_offset(), _et_offset(), range_start, mcap_tier)
 
             cursor = conn.execute(sql, params)
             rows = cursor.fetchall()
@@ -162,7 +169,7 @@ def analytics_heatmap_hourly(
             # Compute dataset_days and total stats
             stats_sql = """
                 SELECT
-                    COUNT(DISTINCT DATE(datetime(s.timestamp, '-4 hours'))) as dataset_days,
+                    COUNT(DISTINCT DATE(datetime(s.timestamp, ?))) as dataset_days,
                     COUNT(*) as total_signals,
                     COUNT(DISTINCT s.ticker) as unique_tickers
                 FROM signals s
@@ -172,20 +179,17 @@ def analytics_heatmap_hourly(
             if mcap_tier != "all":
                 stats_sql = """
                     SELECT
-                        COUNT(DISTINCT DATE(datetime(s.timestamp, '-4 hours'))) as dataset_days,
+                        COUNT(DISTINCT DATE(datetime(s.timestamp, ?))) as dataset_days,
                         COUNT(*) as total_signals,
                         COUNT(DISTINCT s.ticker) as unique_tickers
                     FROM signals s
                     LEFT JOIN daily_calls dc ON dc.ticker = s.ticker
-                        AND dc.et_day = DATE(datetime(s.timestamp, '-4 hours'))
+                        AND dc.et_day = DATE(datetime(s.timestamp, ?))
                         AND dc.activity_type = s.activity_type
                     WHERE s.timestamp >= ? AND dc.mcap_tier = ?
                 """
 
-            stats_row = conn.execute(
-                stats_sql,
-                params if mcap_tier != "all" else (range_start,)
-            ).fetchone()
+            stats_row = conn.execute(stats_sql, params).fetchone()
 
             return {
                 "range": range,
@@ -228,7 +232,7 @@ def analytics_windows_4h(
             if mcap_tier == "all":
                 sql = """
                     SELECT
-                        (CAST(strftime('%H', datetime(s.timestamp, '-4 hours')) AS INT) / 4) * 4 as window_start,
+                        (CAST(strftime('%H', datetime(s.timestamp, ?)) AS INT) / 4) * 4 as window_start,
                         COUNT(*) as signal_count,
                         SUM(CASE WHEN s.activity_type='BUY' THEN 1 ELSE 0 END) as buy_count,
                         SUM(CASE WHEN s.activity_type='SELL' THEN 1 ELSE 0 END) as sell_count,
@@ -237,24 +241,24 @@ def analytics_windows_4h(
                     GROUP BY window_start
                     ORDER BY window_start
                 """
-                params = ()
+                params = (_et_offset(),)
             else:
                 sql = """
                     SELECT
-                        (CAST(strftime('%H', datetime(s.timestamp, '-4 hours')) AS INT) / 4) * 4 as window_start,
+                        (CAST(strftime('%H', datetime(s.timestamp, ?)) AS INT) / 4) * 4 as window_start,
                         COUNT(*) as signal_count,
                         SUM(CASE WHEN s.activity_type='BUY' THEN 1 ELSE 0 END) as buy_count,
                         SUM(CASE WHEN s.activity_type='SELL' THEN 1 ELSE 0 END) as sell_count,
                         ROUND(AVG(CASE WHEN s.boost IS NOT NULL THEN s.boost ELSE 0 END), 2) as avg_boost
                     FROM signals s
                     LEFT JOIN daily_calls dc ON dc.ticker = s.ticker
-                        AND dc.et_day = DATE(datetime(s.timestamp, 'localtime', '-4 hours'))
+                        AND dc.et_day = DATE(datetime(s.timestamp, ?))
                         AND dc.activity_type = s.activity_type
                     WHERE dc.mcap_tier = ?
                     GROUP BY window_start
                     ORDER BY window_start
                 """
-                params = (mcap_tier,)
+                params = (_et_offset(), _et_offset(), mcap_tier)
 
             cursor = conn.execute(sql, params)
             rows = cursor.fetchall()

@@ -162,7 +162,7 @@ class DailyCall(SQLModel, table=True):
     first_call_efficiency_pct:  Optional[float] = Field(default=None)  # (eod - first_price) / first_price * 100
     last_call_efficiency_pct:   Optional[float] = Field(default=None)  # (eod - last_price) / last_price * 100
     intraday_drift_pct:         Optional[float] = Field(default=None)  # (last_price - first_price) / first_price * 100
-    avg_trade_hours:            Optional[float] = Field(default=None)  # hours from first_call_time_et to 23:59 ET
+    hours_remaining_at_first_call: Optional[float] = Field(default=None)  # hours from first_call_time_et to 23:59 ET (not an average)
     direction_correct:          Optional[int]   = Field(default=None)  # 1 | 0 | NULL (bool, null if eod missing)
 
     # Data quality flags
