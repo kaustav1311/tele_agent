@@ -227,6 +227,15 @@ def rebuild_daily_calls(engine) -> int:
             first_sig = signals[0]
             last_sig = signals[-1]
 
+            # Compute intraday_drift_pct
+            intraday_drift_pct = None
+            if (first_sig.price_at_signal and last_sig.price_at_signal and
+                first_sig.price_at_signal != 0):
+                intraday_drift_pct = round(
+                    (last_sig.price_at_signal - first_sig.price_at_signal)
+                    / first_sig.price_at_signal * 100, 2
+                )
+
             daily_call = DailyCall(
                 ticker=ticker,
                 et_day=et_day,
@@ -239,6 +248,7 @@ def rebuild_daily_calls(engine) -> int:
                 last_call_time_et=_get_et_time(last_sig.timestamp),
                 call_count=len(signals),
                 max_boost=max((s.boost for s in signals if s.boost is not None), default=None),
+                intraday_drift_pct=intraday_drift_pct,
                 dq_first_price_missing=(1 if first_sig.price_at_signal is None else 0),
                 dq_last_price_missing=(1 if last_sig.price_at_signal is None else 0),
                 dq_eod_missing=1,
@@ -495,6 +505,15 @@ def upsert_daily_calls_for(engine, signal: Signal) -> None:
         ).first()
 
         # Recalculate daily_calls fields
+        # Compute intraday_drift_pct
+        intraday_drift_pct = None
+        if (first_sig.price_at_signal and last_sig.price_at_signal and
+            first_sig.price_at_signal != 0):
+            intraday_drift_pct = round(
+                (last_sig.price_at_signal - first_sig.price_at_signal)
+                / first_sig.price_at_signal * 100, 2
+            )
+
         if existing:
             # Update existing row
             existing.first_call_msg_id = first_sig.message_id
@@ -505,6 +524,7 @@ def upsert_daily_calls_for(engine, signal: Signal) -> None:
             existing.last_call_time_et = _get_et_time(last_sig.timestamp)
             existing.call_count = len(same_day_signals)
             existing.max_boost = max((s.boost for s in same_day_signals if s.boost is not None), default=None)
+            existing.intraday_drift_pct = intraday_drift_pct
             existing.dq_first_price_missing = (1 if first_sig.price_at_signal is None else 0)
             existing.dq_last_price_missing = (1 if last_sig.price_at_signal is None else 0)
             session.add(existing)
@@ -522,6 +542,7 @@ def upsert_daily_calls_for(engine, signal: Signal) -> None:
                 last_call_time_et=_get_et_time(last_sig.timestamp),
                 call_count=len(same_day_signals),
                 max_boost=max((s.boost for s in same_day_signals if s.boost is not None), default=None),
+                intraday_drift_pct=intraday_drift_pct,
                 dq_first_price_missing=(1 if first_sig.price_at_signal is None else 0),
                 dq_last_price_missing=(1 if last_sig.price_at_signal is None else 0),
                 dq_eod_missing=1,

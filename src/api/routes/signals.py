@@ -203,17 +203,17 @@ def signals_prev_day(
     Query parameters:
     - sort: "avg_boost" (default) | "first_call_time" | "call_count" | "intraday_drift"
     - activity_type: "BUY" | "SELL" | "ALL" (default)
-    - boost_min: Optional. Filter rows where max_boost >= boost_min
+    - boost_min: Optional. Filter rows where avg_boost >= boost_min
 
     Response shape:
     {
         "et_day": "2026-04-13",
         "summary": {
             "total_signals": 42,
-            "total_ticker_directions": 12,
             "buy_tickers": 8,
             "sell_tickers": 4,
-            "avg_boost_day": 5.8
+            "avg_boost_buy": 5.5,
+            "avg_boost_sell": 6.1
         },
         "tickers": [...]
     }
@@ -232,23 +232,17 @@ def signals_prev_day(
                 where_clause += " AND dc.activity_type = ?"
                 params.append(activity_type)
 
-            if boost_min is not None:
-                where_clause += " AND dc.max_boost >= ?"
-                params.append(boost_min)
-
             daily_calls_rows = conn.execute(
                 f"""
                 SELECT
-                    dc.ticker, dc.activity_type, dc.call_count, dc.max_boost,
+                    dc.ticker, dc.activity_type, dc.call_count,
                     dc.first_call_price, dc.last_call_price,
                     dc.first_call_time_et, dc.last_call_time_et,
                     dc.intraday_drift_pct,
                     dc.direction_correct,
                     dc.first_call_efficiency_pct,
-                    dc.last_call_efficiency_pct,
                     dc.eod_price,
-                    dc.mcap_tier,
-                    dc.dq_first_price_missing, dc.dq_last_price_missing, dc.dq_eod_missing
+                    dc.dq_eod_missing
                 FROM daily_calls dc
                 {where_clause}
                 """
@@ -256,12 +250,12 @@ def signals_prev_day(
             ).fetchall()
 
             # Compute avg_boost per (ticker, activity_type) from signals
-            boost_query_where = "WHERE DATE(datetime(s.timestamp, ?)) = ?"
+            # Always exclude UNKNOWN signals
+            boost_query_where = (
+                "WHERE DATE(datetime(s.timestamp, ?)) = ? "
+                "AND s.activity_type IN ('BUY','SELL')"
+            )
             boost_params = [_et_offset(), prev_et_day]
-
-            if activity_type in ("BUY", "SELL"):
-                boost_query_where += " AND s.activity_type = ?"
-                boost_params.append(activity_type)
 
             avg_boost_rows = conn.execute(
                 f"""
@@ -280,53 +274,63 @@ def signals_prev_day(
                 key = (row["ticker"], row["activity_type"])
                 avg_boost_map[key] = row["avg_boost"]
 
-            # Compute header stats
+            # Compute total_signals: all BUY/SELL signals for the day
             total_signals = conn.execute(
                 f"SELECT COUNT(*) as cnt FROM signals s {boost_query_where}",
                 boost_params
             ).fetchone()["cnt"]
 
+            # Apply boost_min filter post-avg_boost-map-build (filter on avg_boost, not max_boost)
+            if boost_min is not None:
+                daily_calls_rows = [
+                    r for r in daily_calls_rows
+                    if (avg_boost_map.get((r["ticker"], r["activity_type"])) or 0) >= boost_min
+                ]
+
+            # Recompute buy/sell counts after boost_min filter
             buy_count = sum(1 for r in daily_calls_rows if r["activity_type"] == "BUY")
             sell_count = sum(1 for r in daily_calls_rows if r["activity_type"] == "SELL")
 
-            # Calculate avg_boost for day
-            if daily_calls_rows:
-                day_boost_sum = sum(
-                    avg_boost_map.get((r["ticker"], r["activity_type"]), 0)
-                    for r in daily_calls_rows
-                )
-                day_boost_count = len(daily_calls_rows)
-                avg_boost_day = round(day_boost_sum / day_boost_count, 2) if day_boost_count > 0 else 0.0
-            else:
-                avg_boost_day = 0.0
+            # Compute avg_boost_buy and avg_boost_sell for the entire day
+            avg_boost_buy = conn.execute(
+                "SELECT ROUND(AVG(s.boost), 2) FROM signals s "
+                "WHERE DATE(datetime(s.timestamp, ?)) = ? AND s.activity_type = 'BUY'",
+                [_et_offset(), prev_et_day]
+            ).fetchone()[0]
 
-            # Build ticker rows
+            avg_boost_sell = conn.execute(
+                "SELECT ROUND(AVG(s.boost), 2) FROM signals s "
+                "WHERE DATE(datetime(s.timestamp, ?)) = ? AND s.activity_type = 'SELL'",
+                [_et_offset(), prev_et_day]
+            ).fetchone()[0]
+
+            # Build ticker rows with streak_days cache
             tickers = []
+            streak_cache = {}
             for dc_row in daily_calls_rows:
                 ticker = dc_row["ticker"]
                 act_type = dc_row["activity_type"]
                 avg_boost = avg_boost_map.get((ticker, act_type), None)
+                dq_eod_missing = bool(dc_row["dq_eod_missing"])
+
+                if ticker not in streak_cache:
+                    streak_cache[ticker] = get_streak_days(ticker, conn)
 
                 tickers.append({
                     "ticker": ticker,
                     "activity_type": act_type,
-                    "call_count": dc_row["call_count"],
                     "avg_boost": avg_boost,
+                    "call_count": dc_row["call_count"],
                     "first_call_price": dc_row["first_call_price"],
-                    "last_call_price": dc_row["last_call_price"],
                     "first_call_time_et": dc_row["first_call_time_et"],
+                    "last_call_price": dc_row["last_call_price"],
                     "last_call_time_et": dc_row["last_call_time_et"],
                     "intraday_drift_pct": dc_row["intraday_drift_pct"],
+                    "eod_price": None if dq_eod_missing else dc_row["eod_price"],
                     "direction_correct": dc_row["direction_correct"],
-                    "first_call_efficiency_pct": dc_row["first_call_efficiency_pct"],
-                    "last_call_efficiency_pct": dc_row["last_call_efficiency_pct"],
-                    "eod_price": dc_row["eod_price"],
-                    "mcap_tier": dc_row["mcap_tier"],
-                    "dq_flags": {
-                        "first_price_missing": bool(dc_row["dq_first_price_missing"]),
-                        "last_price_missing": bool(dc_row["dq_last_price_missing"]),
-                        "eod_missing": bool(dc_row["dq_eod_missing"]),
-                    }
+                    "pnl_pct": dc_row["first_call_efficiency_pct"],
+                    "streak_days": streak_cache[ticker],
+                    "dq_eod_missing": dq_eod_missing,
                 })
 
             # Apply sorting
@@ -343,10 +347,10 @@ def signals_prev_day(
                 "et_day": prev_et_day,
                 "summary": {
                     "total_signals": total_signals,
-                    "total_ticker_directions": len(daily_calls_rows),
                     "buy_tickers": buy_count,
                     "sell_tickers": sell_count,
-                    "avg_boost_day": avg_boost_day,
+                    "avg_boost_buy": avg_boost_buy,
+                    "avg_boost_sell": avg_boost_sell,
                 },
                 "tickers": tickers,
             }
