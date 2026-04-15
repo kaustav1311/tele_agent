@@ -486,37 +486,49 @@ def upsert_daily_calls_for(engine, signal: Signal) -> None:
         first_sig = min(same_day_signals, key=lambda s: s.timestamp)
         last_sig = max(same_day_signals, key=lambda s: s.timestamp)
 
-        # Recalculate daily_calls fields
-        daily_call = DailyCall(
-            ticker=ticker,
-            et_day=et_day,
-            activity_type=activity_type,
-            first_call_msg_id=first_sig.message_id,
-            first_call_price=first_sig.price_at_signal,
-            first_call_time_et=_get_et_time(first_sig.timestamp),
-            last_call_msg_id=last_sig.message_id,
-            last_call_price=last_sig.price_at_signal,
-            last_call_time_et=_get_et_time(last_sig.timestamp),
-            call_count=len(same_day_signals),
-            max_boost=max((s.boost for s in same_day_signals if s.boost is not None), default=None),
-            # Blocked fields (set to null/default):
-            eod_price=None,
-            eod_fetched_at=None,
-            mcap_at_call=None,
-            mcap_tier=None,
-            first_call_efficiency_pct=None,
-            last_call_efficiency_pct=None,
-            intraday_drift_pct=None,
-            avg_trade_hours=None,
-            direction_correct=None,
-            dq_first_price_missing=(1 if first_sig.price_at_signal is None else 0),
-            dq_last_price_missing=(1 if last_sig.price_at_signal is None else 0),
-            dq_eod_missing=1,  # always starts as 1 until EOD backfill
-            dq_mcap_missing=0,
-        )
+        # Check if row already exists for this (ticker, et_day, activity_type)
+        existing = session.exec(
+            select(DailyCall)
+            .where(DailyCall.ticker == ticker)
+            .where(DailyCall.et_day == et_day)
+            .where(DailyCall.activity_type == activity_type)
+        ).first()
 
-        # Use INSERT OR REPLACE (upsert) on unique (ticker, et_day, activity_type)
-        session.merge(daily_call)
+        # Recalculate daily_calls fields
+        if existing:
+            # Update existing row
+            existing.first_call_msg_id = first_sig.message_id
+            existing.first_call_price = first_sig.price_at_signal
+            existing.first_call_time_et = _get_et_time(first_sig.timestamp)
+            existing.last_call_msg_id = last_sig.message_id
+            existing.last_call_price = last_sig.price_at_signal
+            existing.last_call_time_et = _get_et_time(last_sig.timestamp)
+            existing.call_count = len(same_day_signals)
+            existing.max_boost = max((s.boost for s in same_day_signals if s.boost is not None), default=None)
+            existing.dq_first_price_missing = (1 if first_sig.price_at_signal is None else 0)
+            existing.dq_last_price_missing = (1 if last_sig.price_at_signal is None else 0)
+            session.add(existing)
+        else:
+            # Create new row
+            daily_call = DailyCall(
+                ticker=ticker,
+                et_day=et_day,
+                activity_type=activity_type,
+                first_call_msg_id=first_sig.message_id,
+                first_call_price=first_sig.price_at_signal,
+                first_call_time_et=_get_et_time(first_sig.timestamp),
+                last_call_msg_id=last_sig.message_id,
+                last_call_price=last_sig.price_at_signal,
+                last_call_time_et=_get_et_time(last_sig.timestamp),
+                call_count=len(same_day_signals),
+                max_boost=max((s.boost for s in same_day_signals if s.boost is not None), default=None),
+                dq_first_price_missing=(1 if first_sig.price_at_signal is None else 0),
+                dq_last_price_missing=(1 if last_sig.price_at_signal is None else 0),
+                dq_eod_missing=1,
+                dq_mcap_missing=0,
+            )
+            session.add(daily_call)
+
         session.commit()
 
     finally:
