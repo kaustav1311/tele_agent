@@ -274,6 +274,10 @@ def signals_prev_day(
                 key = (row["ticker"], row["activity_type"])
                 avg_boost_map[key] = row["avg_boost"]
 
+            # Debug: log if avg_boost_map is empty
+            if not avg_boost_map:
+                print(f"WARNING: avg_boost_map is empty! boost_params={boost_params}, prev_et_day={prev_et_day}")
+
             # Compute total_signals: all BUY/SELL signals for the day
             total_signals = conn.execute(
                 f"SELECT COUNT(*) as cnt FROM signals s {boost_query_where}",
