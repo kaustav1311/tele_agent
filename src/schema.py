@@ -2,10 +2,13 @@
 # SQLModel table definitions for Signal Agent.
 # Four tables: signals, metrics_cache, unparsed_messages, daily_signal_summary.
 
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 from sqlmodel import Field, SQLModel
+
+logger = logging.getLogger(__name__)
 
 
 def utcnow() -> datetime:
@@ -245,6 +248,11 @@ def rebuild_daily_calls(engine) -> int:
                 )
             else:
                 intraday_drift_pct = None
+                logger.debug(
+                    "drift=None rebuild %s %s %s | raw first=%r last=%r",
+                    ticker, et_day, activity_type,
+                    first_sig.price_at_signal, last_sig.price_at_signal,
+                )
 
             daily_call = DailyCall(
                 ticker=ticker,
@@ -259,8 +267,8 @@ def rebuild_daily_calls(engine) -> int:
                 call_count=len(signals),
                 max_boost=max((s.boost for s in signals if s.boost is not None), default=None),
                 intraday_drift_pct=intraday_drift_pct,
-                dq_first_price_missing=(1 if first_sig.price_at_signal is None else 0),
-                dq_last_price_missing=(1 if last_sig.price_at_signal is None else 0),
+                dq_first_price_missing=(0 if _safe_float(first_sig.price_at_signal) is not None else 1),
+                dq_last_price_missing=(0 if _safe_float(last_sig.price_at_signal) is not None else 1),
                 dq_eod_missing=1,
                 dq_mcap_missing=0,
             )
@@ -272,6 +280,11 @@ def rebuild_daily_calls(engine) -> int:
         session.commit()
 
         row_count = len(daily_calls_rows)
+        null_drift = sum(1 for r in daily_calls_rows if r.intraday_drift_pct is None)
+        logger.info(
+            "rebuild_daily_calls: %d rows | drift computed=%d null=%d",
+            row_count, row_count - null_drift, null_drift,
+        )
         return row_count
 
     finally:
@@ -333,17 +346,15 @@ def backfill_missing_daily_calls(engine) -> int:
                 ),
                 intraday_drift_pct=(
                     round(
-                        (last_sig.price_at_signal - first_sig.price_at_signal)
-                        / first_sig.price_at_signal * 100,
-                        4,
+                        (_safe_float(last_sig.price_at_signal) - _safe_float(first_sig.price_at_signal))
+                        / _safe_float(first_sig.price_at_signal) * 100, 2,
                     )
-                    if first_sig.price_at_signal
-                    and last_sig.price_at_signal
-                    and first_sig.price_at_signal != 0
+                    if _safe_float(first_sig.price_at_signal) is not None
+                    and _safe_float(last_sig.price_at_signal) is not None
                     else None
                 ),
-                dq_first_price_missing=(1 if first_sig.price_at_signal is None else 0),
-                dq_last_price_missing=(1 if last_sig.price_at_signal is None else 0),
+                dq_first_price_missing=(0 if _safe_float(first_sig.price_at_signal) is not None else 1),
+                dq_last_price_missing=(0 if _safe_float(last_sig.price_at_signal) is not None else 1),
                 dq_eod_missing=1,
                 dq_mcap_missing=0,
             )
@@ -522,8 +533,18 @@ def upsert_daily_calls_for(engine, signal: Signal) -> None:
             intraday_drift_pct = round(
                 (last_price - first_price) / first_price * 100, 2
             )
+            logger.debug(
+                "drift=%.2f upsert %s %s %s | first=%s last=%s",
+                intraday_drift_pct, ticker, et_day, activity_type,
+                first_price, last_price,
+            )
         else:
             intraday_drift_pct = None
+            logger.debug(
+                "drift=None upsert %s %s %s | raw first=%r last=%r",
+                ticker, et_day, activity_type,
+                first_sig.price_at_signal, last_sig.price_at_signal,
+            )
 
         if existing:
             # Update existing row
@@ -536,8 +557,8 @@ def upsert_daily_calls_for(engine, signal: Signal) -> None:
             existing.call_count = len(same_day_signals)
             existing.max_boost = max((s.boost for s in same_day_signals if s.boost is not None), default=None)
             existing.intraday_drift_pct = intraday_drift_pct
-            existing.dq_first_price_missing = (1 if first_sig.price_at_signal is None else 0)
-            existing.dq_last_price_missing = (1 if last_sig.price_at_signal is None else 0)
+            existing.dq_first_price_missing = (0 if _safe_float(first_sig.price_at_signal) is not None else 1)
+            existing.dq_last_price_missing = (0 if _safe_float(last_sig.price_at_signal) is not None else 1)
             session.add(existing)
         else:
             # Create new row
@@ -554,8 +575,8 @@ def upsert_daily_calls_for(engine, signal: Signal) -> None:
                 call_count=len(same_day_signals),
                 max_boost=max((s.boost for s in same_day_signals if s.boost is not None), default=None),
                 intraday_drift_pct=intraday_drift_pct,
-                dq_first_price_missing=(1 if first_sig.price_at_signal is None else 0),
-                dq_last_price_missing=(1 if last_sig.price_at_signal is None else 0),
+                dq_first_price_missing=(0 if _safe_float(first_sig.price_at_signal) is not None else 1),
+                dq_last_price_missing=(0 if _safe_float(last_sig.price_at_signal) is not None else 1),
                 dq_eod_missing=1,
                 dq_mcap_missing=0,
             )
