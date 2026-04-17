@@ -2,7 +2,7 @@
 # ET-aligned candle start times for each timeframe.
 # Uses zoneinfo (stdlib, Python 3.9+) — no pytz dependency.
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
@@ -54,19 +54,19 @@ def get_candle_start(timeframe: str) -> datetime:
 
     elif timeframe == "1hr_rolling":
         # Pure rolling window: now - 3600 seconds (no candle boundary)
-        return now_utc - __import__('datetime').timedelta(seconds=3600)
+        return now_utc - timedelta(seconds=3600)
 
     elif timeframe == "15m_rolling":
         # Pure rolling window: now - 900 seconds (no candle boundary)
-        return now_utc - __import__('datetime').timedelta(seconds=900)
+        return now_utc - timedelta(seconds=900)
 
     elif timeframe == "4h_rolling":
         # Pure rolling window: now - 14400 seconds (no candle boundary)
-        return now_utc - __import__('datetime').timedelta(seconds=14400)
+        return now_utc - timedelta(seconds=14400)
 
     elif timeframe == "1d_rolling":
         # Pure rolling window: now - 86400 seconds (no candle boundary)
-        return now_utc - __import__('datetime').timedelta(seconds=86400)
+        return now_utc - timedelta(seconds=86400)
 
     else:
         raise ValueError(f"Unknown timeframe: {timeframe!r}. Must be one of: 5m, 15m, 1h, 4h, daily, 1hr_rolling, 15m_rolling, 4h_rolling, 1d_rolling")
