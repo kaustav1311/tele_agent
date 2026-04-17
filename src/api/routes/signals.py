@@ -23,7 +23,7 @@ def _et_offset() -> str:
     h = secs // 3600
     return f"{h} hours"
 
-TIMEFRAMES = ["5m", "15m", "1h", "4h", "daily", "1hr_rolling"]
+TIMEFRAMES = ["5m", "15m", "1h", "4h", "daily", "1hr_rolling", "15m_rolling", "4h_rolling", "1d_rolling"]
 
 
 def _get_conn():
@@ -75,8 +75,8 @@ def _format_signal(row, has_conflicting_activity: bool = False) -> dict:
         "has_conflicting_activity": has_conflicting_activity,
         "first_call_price":         row["first_call_price"],
         "last_call_price":          row["price_at_signal"],  # latest signal in window
-        "first_call_time_et":       first_call_ts_utc.astimezone(ET).strftime("%H:%M") if first_call_ts_utc else None,
-        "last_call_time_et":        ts_utc.astimezone(ET).strftime("%H:%M") if ts_utc else None,
+        "first_call_time_utc":      first_call_ts_utc.isoformat() if first_call_ts_utc else None,
+        "last_call_time_utc":       ts_utc.isoformat() if ts_utc else None,
     }
 
 

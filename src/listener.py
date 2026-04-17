@@ -211,7 +211,12 @@ async def main():
             )
 
         logger.info("Listener live. Waiting for new messages...")
-        await client.run_until_disconnected()
+        try:
+            await client.run_until_disconnected()
+        except asyncio.CancelledError:
+            logger.info("Listener stopped.")
+        finally:
+            session.close()
 
 
 if __name__ == "__main__":

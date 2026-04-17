@@ -11,7 +11,7 @@ ET = ZoneInfo("America/New_York")
 def get_candle_start(timeframe: str) -> datetime:
     """
     Return the UTC datetime of the current ET candle start for a given timeframe.
-    Timeframes: "5m", "15m", "1h", "4h", "daily", "1hr_rolling"
+    Timeframes: "5m", "15m", "1h", "4h", "daily", "1hr_rolling", "15m_rolling", "4h_rolling", "1d_rolling"
 
     - 5m: floor to nearest :00/:05/:10/…/:55
     - 15m: floor to nearest :00/:15/:30/:45
@@ -19,6 +19,9 @@ def get_candle_start(timeframe: str) -> datetime:
     - 4h: floor to 4-hour boundary (00, 04, 08, 12, 16, 20 ET)
     - daily: floor to ET midnight
     - 1hr_rolling: NOW - 3600 seconds (pure rolling, not candle-aligned)
+    - 15m_rolling: NOW - 900 seconds (pure rolling, not candle-aligned)
+    - 4h_rolling: NOW - 14400 seconds (pure rolling, not candle-aligned)
+    - 1d_rolling: NOW - 86400 seconds (pure rolling, not candle-aligned)
     """
     now_utc = datetime.now(timezone.utc)
     now_et = now_utc.astimezone(ET)
@@ -53,5 +56,17 @@ def get_candle_start(timeframe: str) -> datetime:
         # Pure rolling window: now - 3600 seconds (no candle boundary)
         return now_utc - __import__('datetime').timedelta(seconds=3600)
 
+    elif timeframe == "15m_rolling":
+        # Pure rolling window: now - 900 seconds (no candle boundary)
+        return now_utc - __import__('datetime').timedelta(seconds=900)
+
+    elif timeframe == "4h_rolling":
+        # Pure rolling window: now - 14400 seconds (no candle boundary)
+        return now_utc - __import__('datetime').timedelta(seconds=14400)
+
+    elif timeframe == "1d_rolling":
+        # Pure rolling window: now - 86400 seconds (no candle boundary)
+        return now_utc - __import__('datetime').timedelta(seconds=86400)
+
     else:
-        raise ValueError(f"Unknown timeframe: {timeframe!r}. Must be one of: 5m, 15m, 1h, 4h, daily, 1hr_rolling")
+        raise ValueError(f"Unknown timeframe: {timeframe!r}. Must be one of: 5m, 15m, 1h, 4h, daily, 1hr_rolling, 15m_rolling, 4h_rolling, 1d_rolling")
