@@ -12,8 +12,12 @@ from pathlib import Path
 from dotenv import load_dotenv
 from sqlmodel import select
 from telethon import TelegramClient, events
+from zoneinfo import ZoneInfo
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 from src.parser import parse, ParserError
+from src.backfill_eod import run_eod_backfill
 from src.schema import (
     Signal,
     UnparsedMessage,
@@ -165,6 +169,18 @@ async def backfill(client: TelegramClient, session, engine, channel):
 
 
 # ---------------------------------------------------------------------------
+# EOD backfill helper
+# ---------------------------------------------------------------------------
+
+def _prev_et_day() -> str:
+    """Returns the previous ET calendar day as YYYY-MM-DD string."""
+    from datetime import timedelta
+    et_now = datetime.now(ZoneInfo("America/New_York"))
+    prev = et_now - timedelta(days=1)
+    return prev.strftime("%Y-%m-%d")
+
+
+# ---------------------------------------------------------------------------
 # Main: start listener with backfill
 # ---------------------------------------------------------------------------
 
@@ -196,6 +212,20 @@ async def main():
         gap_rows = backfill_missing_daily_calls(engine)
         logger.info(f"daily_calls gap fill: {gap_rows} new rows inserted")
 
+        # -----------------------------------------------------------------------
+        # APScheduler: EOD backfill fires at 00:05 ET every day
+        # -----------------------------------------------------------------------
+        scheduler = BackgroundScheduler(timezone="America/New_York")
+        scheduler.add_job(
+            lambda: run_eod_backfill(_prev_et_day()),
+            CronTrigger(hour=0, minute=5, timezone="America/New_York"),
+            id="eod_backfill_daily",
+            replace_existing=True,
+            misfire_grace_time=300,   # allow up to 5min late if listener was down
+        )
+        scheduler.start()
+        logger.info("APScheduler started: EOD backfill scheduled at 00:05 ET daily")
+
         # Live listener — fires on every new message in channel
         @client.on(events.NewMessage(chats=channel))
         async def on_new_message(event):
@@ -217,6 +247,8 @@ async def main():
             logger.info("Listener stopped.")
         finally:
             session.close()
+            scheduler.shutdown(wait=False)
+            logger.info("APScheduler stopped.")
 
 
 if __name__ == "__main__":

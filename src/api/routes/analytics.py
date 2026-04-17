@@ -1,417 +1,677 @@
 # src/api/routes/analytics.py
-# Analytics endpoints — heatmap/hourly, windows/4h, filters.
+# Analytics endpoints — summary cards, trends, accuracy, scatter, leaderboard.
 
-from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
-from collections import defaultdict
-
-from fastapi import APIRouter, Query, HTTPException
-from sqlalchemy import text
 import os
 import sqlite3
-import traceback
+import logging
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from fastapi import APIRouter, HTTPException, Query
+
+logger = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
 
 router = APIRouter()
 
 
-def _et_offset() -> str:
-    """Return current UTC-to-ET offset string for SQLite datetime(), e.g. '-4 hours' or '-5 hours'."""
-    secs = int(datetime.now(ET).utcoffset().total_seconds())
-    h = secs // 3600
-    return f"{h} hours"
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _get_conn():
-    """Raw sqlite3 connection for parameterized queries."""
     db_path = os.environ.get("DB_PATH", "data/signals.db")
-    conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES)
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def _parse_ts(val) -> datetime | None:
-    """Parse a timestamp value that may be a string, datetime, or None."""
-    if val is None:
-        return None
-    if isinstance(val, datetime):
-        return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
-    if isinstance(val, str):
-        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
-            try:
-                return datetime.strptime(val, fmt).replace(tzinfo=timezone.utc)
-            except ValueError:
-                continue
-    return None
+def _today_et() -> str:
+    return datetime.now(ET).strftime("%Y-%m-%d")
 
 
-def _get_et_hour(ts_utc: datetime) -> int:
-    """Convert UTC datetime to ET hour (0-23)."""
-    if not ts_utc:
-        return 0
-    et_dt = ts_utc.astimezone(ET)
-    return et_dt.hour
+def _range_start(range_: str, today_et: str) -> str | None:
+    """Return lower-bound et_day string for range, or None for 'all'."""
+    if range_ == "1d":
+        d = datetime.strptime(today_et, "%Y-%m-%d") - timedelta(days=1)
+        return d.strftime("%Y-%m-%d")
+    if range_ == "7d":
+        d = datetime.strptime(today_et, "%Y-%m-%d") - timedelta(days=7)
+        return d.strftime("%Y-%m-%d")
+    if range_ == "30d":
+        d = datetime.strptime(today_et, "%Y-%m-%d") - timedelta(days=30)
+        return d.strftime("%Y-%m-%d")
+    return None  # "all"
 
 
-def _get_et_day_and_hour(ts_utc: datetime) -> tuple[str, int]:
-    """Convert UTC datetime to (YYYY-MM-DD in ET, hour in ET)."""
-    if not ts_utc:
-        return ("", 0)
-    et_dt = ts_utc.astimezone(ET)
-    et_day = et_dt.strftime("%Y-%m-%d")
-    return (et_day, et_dt.hour)
+def _days_in_range(range_: str) -> int:
+    return {"1d": 1, "7d": 7, "30d": 30}.get(range_, 0)
 
 
-def _get_4h_window(hour: int) -> str:
-    """Convert hour (0-23) to 4-hour window string."""
-    window_start = (hour // 4) * 4
-    window_end = window_start + 4
-    return f"{window_start:02d}-{window_end:02d}"
+def _validate_range(r: str) -> str:
+    return r if r in ("1d", "7d", "30d", "all") else "7d"
 
 
-@router.get("/analytics/heatmap/hourly")
-def analytics_heatmap_hourly(
-    range: str = Query("7d"),
-    mcap_tier: str = Query("all"),
-):
-    """
-    Returns signal count per ET hour (0–23) aggregated over a date range,
-    optionally filtered by MCap tier.
-
-    Query parameters:
-    - range: "1d" (today) | "7d" (last 7 days, default) | "all" (full DB history)
-    - mcap_tier: "micro" | "small" | "mid" | "large" | "unknown" | "all" (default)
-
-    Response includes 24 hourly buckets with buy/sell split and avg boost.
-    """
-    try:
-        if range not in ("1d", "7d", "all"):
-            range = "7d"
-
-        if mcap_tier not in ("micro", "small", "mid", "large", "unknown", "all"):
-            mcap_tier = "all"
-
-        conn = _get_conn()
-        try:
-            # Compute range_start in UTC
-            now_et = datetime.now(ET)
-            if range == "1d":
-                range_start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
-            elif range == "7d":
-                range_start_et = (now_et - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
-            else:  # "all"
-                range_start = datetime.min.replace(tzinfo=timezone.utc)
-                range_start = range_start.isoformat()
-
-            if range != "all":
-                range_start = range_start_et.astimezone(timezone.utc).isoformat()
-
-            # Build query with optional mcap_tier filter
-            if mcap_tier == "all":
-                sql = """
-                    SELECT
-                        CAST(strftime('%H', datetime(s.timestamp, ?)) AS INTEGER) as hour_et,
-                        COUNT(*) as count,
-                        SUM(CASE WHEN s.activity_type='BUY'  THEN 1 ELSE 0 END) as buy_count,
-                        SUM(CASE WHEN s.activity_type='SELL' THEN 1 ELSE 0 END) as sell_count,
-                        ROUND(AVG(CASE WHEN s.boost IS NOT NULL THEN s.boost ELSE 0 END), 2) as avg_boost
-                    FROM signals s
-                    WHERE s.timestamp >= ?
-                    GROUP BY hour_et
-                    ORDER BY hour_et
-                """
-                params = (_et_offset(), range_start)
-            else:
-                sql = """
-                    SELECT
-                        CAST(strftime('%H', datetime(s.timestamp, ?)) AS INTEGER) as hour_et,
-                        COUNT(*) as count,
-                        SUM(CASE WHEN s.activity_type='BUY'  THEN 1 ELSE 0 END) as buy_count,
-                        SUM(CASE WHEN s.activity_type='SELL' THEN 1 ELSE 0 END) as sell_count,
-                        ROUND(AVG(CASE WHEN s.boost IS NOT NULL THEN s.boost ELSE 0 END), 2) as avg_boost
-                    FROM signals s
-                    LEFT JOIN daily_calls dc ON dc.ticker = s.ticker
-                        AND dc.et_day = DATE(datetime(s.timestamp, ?))
-                        AND dc.activity_type = s.activity_type
-                    WHERE s.timestamp >= ? AND dc.mcap_tier = ?
-                    GROUP BY hour_et
-                    ORDER BY hour_et
-                """
-                params = (_et_offset(), _et_offset(), range_start, mcap_tier)
-
-            cursor = conn.execute(sql, params)
-            rows = cursor.fetchall()
-
-            # Initialize 24-hour buckets
-            hours = []
-            hour_map = {row["hour_et"]: row for row in rows}
-
-            for hour in range(24):
-                if hour in hour_map:
-                    r = hour_map[hour]
-                    hours.append({
-                        "hour_et": hour,
-                        "count": r["count"],
-                        "buy_count": r["buy_count"],
-                        "sell_count": r["sell_count"],
-                        "avg_boost": r["avg_boost"],
-                    })
-                else:
-                    hours.append({
-                        "hour_et": hour,
-                        "count": 0,
-                        "buy_count": 0,
-                        "sell_count": 0,
-                        "avg_boost": None,
-                    })
-
-            # Compute dataset_days and total stats
-            stats_sql = """
-                SELECT
-                    COUNT(DISTINCT DATE(datetime(s.timestamp, ?))) as dataset_days,
-                    COUNT(*) as total_signals,
-                    COUNT(DISTINCT s.ticker) as unique_tickers
-                FROM signals s
-                WHERE s.timestamp >= ?
-            """
-
-            if mcap_tier != "all":
-                stats_sql = """
-                    SELECT
-                        COUNT(DISTINCT DATE(datetime(s.timestamp, ?))) as dataset_days,
-                        COUNT(*) as total_signals,
-                        COUNT(DISTINCT s.ticker) as unique_tickers
-                    FROM signals s
-                    LEFT JOIN daily_calls dc ON dc.ticker = s.ticker
-                        AND dc.et_day = DATE(datetime(s.timestamp, ?))
-                        AND dc.activity_type = s.activity_type
-                    WHERE s.timestamp >= ? AND dc.mcap_tier = ?
-                """
-
-            stats_row = conn.execute(stats_sql, params).fetchone()
-
-            return {
-                "range": range,
-                "mcap_tier": mcap_tier,
-                "dataset_days": stats_row["dataset_days"] if stats_row else 0,
-                "total_signals": stats_row["total_signals"] if stats_row else 0,
-                "unique_tickers": stats_row["unique_tickers"] if stats_row else 0,
-                "hours": hours,
-            }
-
-        finally:
-            conn.close()
-
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Analytics heatmap error: {str(e)}")
-
-
-@router.get("/analytics/windows/4h")
-def analytics_windows_4h(
-    mcap_tier: str = Query("all"),
-):
-    """
-    Returns per-4H-window aggregates of signal volume and boost.
-    Performance metrics (win_rate, avg_return_pct) are currently blocked pending EOD price backfill.
-
-    Query parameters:
-    - mcap_tier: "micro" | "small" | "mid" | "large" | "unknown" | "all" (default)
-
-    Response includes 6 windows (00-04, 04-08, etc.) with volume metrics.
-    Performance fields (win_rate, avg_return_pct) return null with pending_backfill=true.
-    """
-    try:
-        if mcap_tier not in ("micro", "small", "mid", "large", "unknown", "all"):
-            mcap_tier = "all"
-
-        conn = _get_conn()
-        try:
-            # Query signals for volume metrics (available now)
-            if mcap_tier == "all":
-                sql = """
-                    SELECT
-                        (CAST(strftime('%H', datetime(s.timestamp, ?)) AS INT) / 4) * 4 as window_start,
-                        COUNT(*) as signal_count,
-                        SUM(CASE WHEN s.activity_type='BUY' THEN 1 ELSE 0 END) as buy_count,
-                        SUM(CASE WHEN s.activity_type='SELL' THEN 1 ELSE 0 END) as sell_count,
-                        ROUND(AVG(CASE WHEN s.boost IS NOT NULL THEN s.boost ELSE 0 END), 2) as avg_boost
-                    FROM signals s
-                    GROUP BY window_start
-                    ORDER BY window_start
-                """
-                params = (_et_offset(),)
-            else:
-                sql = """
-                    SELECT
-                        (CAST(strftime('%H', datetime(s.timestamp, ?)) AS INT) / 4) * 4 as window_start,
-                        COUNT(*) as signal_count,
-                        SUM(CASE WHEN s.activity_type='BUY' THEN 1 ELSE 0 END) as buy_count,
-                        SUM(CASE WHEN s.activity_type='SELL' THEN 1 ELSE 0 END) as sell_count,
-                        ROUND(AVG(CASE WHEN s.boost IS NOT NULL THEN s.boost ELSE 0 END), 2) as avg_boost
-                    FROM signals s
-                    LEFT JOIN daily_calls dc ON dc.ticker = s.ticker
-                        AND dc.et_day = DATE(datetime(s.timestamp, ?))
-                        AND dc.activity_type = s.activity_type
-                    WHERE dc.mcap_tier = ?
-                    GROUP BY window_start
-                    ORDER BY window_start
-                """
-                params = (_et_offset(), _et_offset(), mcap_tier)
-
-            cursor = conn.execute(sql, params)
-            rows = cursor.fetchall()
-
-            # Build window data
-            window_counts = {}
-            for row in rows:
-                window_start = row["window_start"]
-                window_counts[window_start] = row["signal_count"]
-
-            # Compute call_volume_multiplier
-            avg_count = sum(window_counts.values()) / 6 if window_counts else 1
-            if avg_count == 0:
-                avg_count = 1
-
-            # Build results
-            result_windows = []
-            for window_start in [0, 4, 8, 12, 16, 20]:
-                window_str = f"{window_start:02d}-{window_start+4:02d}"
-                row = next((r for r in rows if r["window_start"] == window_start), None)
-
-                if row:
-                    signal_count = row["signal_count"]
-                    buy_count = row["buy_count"]
-                    sell_count = row["sell_count"]
-                    avg_boost = row["avg_boost"]
-                else:
-                    signal_count = 0
-                    buy_count = 0
-                    sell_count = 0
-                    avg_boost = None
-
-                call_volume_multiplier = signal_count / avg_count if avg_count > 0 else 0
-
-                result_windows.append({
-                    "label": window_str,
-                    "hour_start": window_start,
-                    "signal_count": signal_count,
-                    "buy_count": buy_count,
-                    "sell_count": sell_count,
-                    "avg_boost": avg_boost,
-                    "call_volume_multiplier": round(call_volume_multiplier, 2),
-                    "win_rate": None,  # BLOCKED — pending EOD backfill
-                    "avg_return_pct": None,  # BLOCKED — pending EOD backfill
-                })
-
-            return {
-                "mcap_tier": mcap_tier,
-                "pending_backfill": True,  # EOD prices not yet backfilled
-                "windows": result_windows,
-            }
-
-        finally:
-            conn.close()
-
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Analytics 4h windows error: {str(e)}")
-
+# ---------------------------------------------------------------------------
+# 1. GET /api/analytics/filters
+# ---------------------------------------------------------------------------
 
 @router.get("/analytics/filters")
 def analytics_filters():
-    """
-    Returns distinct filter option lists for Analytics widgets.
-    Prevents hardcoding filter values in frontend.
-
-    Response includes:
-    - mcap_tiers: distinct non-null mcap_tier values from daily_calls
-    - dataset_start_et, dataset_end_et: earliest/latest et_day in daily_calls
-    - total_days: count of distinct et_day in daily_calls
-    """
     try:
+        today = _today_et()
         conn = _get_conn()
         try:
-            # Get distinct mcap_tiers
-            tiers_cursor = conn.execute(
-                "SELECT DISTINCT mcap_tier FROM daily_calls WHERE mcap_tier IS NOT NULL ORDER BY mcap_tier"
-            )
-            mcap_tiers = [row["mcap_tier"] for row in tiers_cursor.fetchall()]
+            tiers = [
+                row["mcap_tier"]
+                for row in conn.execute(
+                    "SELECT DISTINCT mcap_tier FROM daily_calls WHERE mcap_tier IS NOT NULL ORDER BY mcap_tier"
+                ).fetchall()
+            ]
 
-            # Get dataset date range
-            range_cursor = conn.execute(
-                "SELECT MIN(et_day) as start_day, MAX(et_day) as end_day, COUNT(DISTINCT et_day) as total_days FROM daily_calls"
-            )
-            range_row = range_cursor.fetchone()
+            bounds = conn.execute(
+                "SELECT MIN(et_day) as start_day, MAX(et_day) as end_day, "
+                "COUNT(DISTINCT et_day) as total_days FROM daily_calls WHERE et_day < ?",
+                (today,),
+            ).fetchone()
+
+            range_counts = {}
+            for r in ("1d", "7d", "30d", "all"):
+                rs = _range_start(r, today)
+                if rs is not None:
+                    cnt = conn.execute(
+                        "SELECT COUNT(*) FROM daily_calls WHERE et_day >= ? AND et_day < ?",
+                        (rs, today),
+                    ).fetchone()[0]
+                else:
+                    cnt = conn.execute(
+                        "SELECT COUNT(*) FROM daily_calls WHERE et_day < ?",
+                        (today,),
+                    ).fetchone()[0]
+                range_counts[r] = cnt
 
             return {
-                "mcap_tiers": mcap_tiers,
-                "dataset_start_et": range_row["start_day"] if range_row else None,
-                "dataset_end_et": range_row["end_day"] if range_row else None,
-                "total_days": range_row["total_days"] if range_row else 0,
+                "mcap_tiers": tiers,
+                "dataset_start_et": bounds["start_day"] if bounds else None,
+                "dataset_end_et": bounds["end_day"] if bounds else None,
+                "total_days": bounds["total_days"] if bounds else 0,
+                "range_counts": range_counts,
             }
-
         finally:
             conn.close()
+    except Exception:
+        logger.exception("analytics/filters error")
+        raise HTTPException(status_code=500, detail="Analytics error")
 
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Analytics filters error: {str(e)}")
 
+# ---------------------------------------------------------------------------
+# 2. GET /api/analytics/summary-cards?range=7d
+# ---------------------------------------------------------------------------
 
-@router.get("/analytics/dataset-info")
-def dataset_info():
-    """
-    Returns metadata about the signals dataset:
-    - total_signals: total count of signals
-    - unique_tickers: count of distinct tickers
-    - first_signal_at_utc: earliest signal timestamp (UTC)
-    - last_signal_at_utc: latest signal timestamp (UTC)
-    - first_signal_at_ist: earliest signal timestamp (IST)
-    - last_signal_at_ist: latest signal timestamp (IST)
-    """
+@router.get("/analytics/summary-cards")
+def analytics_summary_cards(range: str = Query("7d")):
     try:
+        range = _validate_range(range)
+        today = _today_et()
+        rs = _range_start(range, today)
+
         conn = _get_conn()
         try:
-            query = """
-            SELECT
-                COUNT(*) as total_signals,
-                COUNT(DISTINCT ticker) as unique_tickers,
-                MIN(timestamp) as first_timestamp,
-                MAX(timestamp) as last_timestamp
-            FROM signals
+            # Signals query
+            if rs is not None:
+                sig_rows = conn.execute(
+                    """
+                    SELECT activity_type,
+                           COUNT(*) as cnt,
+                           COUNT(DISTINCT ticker) as unique_tickers,
+                           ROUND(AVG(boost), 2) as avg_boost
+                    FROM signals
+                    WHERE date(datetime(timestamp, '-4 hours')) >= ?
+                      AND date(datetime(timestamp, '-4 hours')) < ?
+                    GROUP BY activity_type
+                    """,
+                    (rs, today),
+                ).fetchall()
+                date_from = rs
+            else:
+                sig_rows = conn.execute(
+                    """
+                    SELECT activity_type,
+                           COUNT(*) as cnt,
+                           COUNT(DISTINCT ticker) as unique_tickers,
+                           ROUND(AVG(boost), 2) as avg_boost
+                    FROM signals
+                    WHERE date(datetime(timestamp, '-4 hours')) < ?
+                    GROUP BY activity_type
+                    """,
+                    (today,),
+                ).fetchall()
+                bounds = conn.execute(
+                    "SELECT MIN(et_day) FROM daily_calls WHERE et_day < ?", (today,)
+                ).fetchone()
+                date_from = bounds[0] if bounds else today
+
+            sig_map = {r["activity_type"]: r for r in sig_rows}
+            buy_row = sig_map.get("BUY")
+            sell_row = sig_map.get("SELL")
+
+            total_buy = buy_row["cnt"] if buy_row else 0
+            total_sell = sell_row["cnt"] if sell_row else 0
+            buy_sell_ratio = round(total_buy / total_sell, 2) if total_sell else None
+
+            # avg_calls_per_ticker from daily_calls
+            if rs is not None:
+                dc_rows = conn.execute(
+                    """
+                    SELECT activity_type, ROUND(AVG(call_count), 2) as avg_calls
+                    FROM daily_calls
+                    WHERE et_day >= ? AND et_day < ?
+                    GROUP BY activity_type
+                    """,
+                    (rs, today),
+                ).fetchall()
+            else:
+                dc_rows = conn.execute(
+                    """
+                    SELECT activity_type, ROUND(AVG(call_count), 2) as avg_calls
+                    FROM daily_calls
+                    WHERE et_day < ?
+                    GROUP BY activity_type
+                    """,
+                    (today,),
+                ).fetchall()
+
+            dc_map = {r["activity_type"]: r for r in dc_rows}
+
+            total_signals = total_buy + total_sell
+            days = _days_in_range(range) if range != "all" else None
+            if days:
+                velocity = round(total_signals / (days * 24.0), 1)
+            else:
+                velocity = None
+
+            # date_to = yesterday et
+            date_to = (
+                datetime.strptime(today, "%Y-%m-%d") - timedelta(days=1)
+            ).strftime("%Y-%m-%d")
+
+            return {
+                "range": range,
+                "date_from": date_from,
+                "date_to": date_to,
+                "avg_boost_buy": buy_row["avg_boost"] if buy_row else None,
+                "avg_boost_sell": sell_row["avg_boost"] if sell_row else None,
+                "avg_calls_per_ticker_buy": dc_map["BUY"]["avg_calls"] if "BUY" in dc_map else None,
+                "avg_calls_per_ticker_sell": dc_map["SELL"]["avg_calls"] if "SELL" in dc_map else None,
+                "total_buy_signals": total_buy,
+                "total_sell_signals": total_sell,
+                "buy_sell_ratio": buy_sell_ratio,
+                "unique_tickers_buy": buy_row["unique_tickers"] if buy_row else 0,
+                "unique_tickers_sell": sell_row["unique_tickers"] if sell_row else 0,
+                "signal_velocity_per_hour": velocity,
+            }
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("analytics/summary-cards error")
+        raise HTTPException(status_code=500, detail="Analytics error")
+
+
+# ---------------------------------------------------------------------------
+# 3. GET /api/analytics/timezone-activity?range=7d
+# ---------------------------------------------------------------------------
+
+@router.get("/analytics/timezone-activity")
+def analytics_timezone_activity(range: str = Query("7d")):
+    try:
+        range = _validate_range(range)
+        today = _today_et()
+        rs = _range_start(range, today)
+        params = (rs, today) if rs is not None else (today,)
+        where_lower = "AND date(datetime(timestamp, '-4 hours')) >= ?" if rs is not None else ""
+
+        conn = _get_conn()
+        try:
+            buy_sql = f"""
+                SELECT CAST(strftime('%H', datetime(first_signal_time, '-4 hours')) AS INT) as hour_et,
+                       COUNT(*) as cnt
+                FROM (
+                    SELECT ticker, MIN(timestamp) as first_signal_time
+                    FROM signals
+                    WHERE activity_type = 'BUY'
+                      {where_lower}
+                      AND date(datetime(timestamp, '-4 hours')) < ?
+                    GROUP BY ticker, date(datetime(timestamp, '-4 hours'))
+                )
+                GROUP BY hour_et
             """
-            cursor = conn.execute(query)
-            row = cursor.fetchone()
+            sell_sql = f"""
+                SELECT CAST(strftime('%H', datetime(first_signal_time, '-4 hours')) AS INT) as hour_et,
+                       COUNT(*) as cnt
+                FROM (
+                    SELECT ticker, MIN(timestamp) as first_signal_time
+                    FROM signals
+                    WHERE activity_type = 'SELL'
+                      {where_lower}
+                      AND date(datetime(timestamp, '-4 hours')) < ?
+                    GROUP BY ticker, date(datetime(timestamp, '-4 hours'))
+                )
+                GROUP BY hour_et
+            """
 
-            if not row:
-                return {
-                    "total_signals": 0,
-                    "unique_tickers": 0,
-                    "first_signal_at_utc": None,
-                    "last_signal_at_utc": None,
-                    "first_signal_at_ist": None,
-                    "last_signal_at_ist": None,
+            buy_map = {r["hour_et"]: r["cnt"] for r in conn.execute(buy_sql, params).fetchall()}
+            sell_map = {r["hour_et"]: r["cnt"] for r in conn.execute(sell_sql, params).fetchall()}
+
+            hours = [
+                {
+                    "hour_et": h,
+                    "buy_new_tickers": buy_map.get(h, 0),
+                    "sell_new_tickers": sell_map.get(h, 0),
                 }
+                for h in range(24)
+            ]
 
-            first_ts = _parse_ts(row["first_timestamp"])
-            last_ts = _parse_ts(row["last_timestamp"])
-
-            IST = ZoneInfo("Asia/Kolkata")
-
-            return {
-                "total_signals": row["total_signals"],
-                "unique_tickers": row["unique_tickers"],
-                "first_signal_at_utc": first_ts.isoformat() if first_ts else None,
-                "last_signal_at_utc": last_ts.isoformat() if last_ts else None,
-                "first_signal_at_ist": first_ts.astimezone(IST).isoformat() if first_ts else None,
-                "last_signal_at_ist": last_ts.astimezone(IST).isoformat() if last_ts else None,
-            }
-
+            return {"range": range, "hours": hours}
         finally:
             conn.close()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("analytics/timezone-activity error")
+        raise HTTPException(status_code=500, detail="Analytics error")
 
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------------------------------------------------------
+# 4. GET /api/analytics/daily-trend?range=7d
+# ---------------------------------------------------------------------------
+
+@router.get("/analytics/daily-trend")
+def analytics_daily_trend(range: str = Query("7d")):
+    try:
+        range = _validate_range(range)
+        today = _today_et()
+        rs = _range_start(range, today)
+
+        conn = _get_conn()
+        try:
+            if rs is not None:
+                vol_rows = conn.execute(
+                    """
+                    SELECT date(datetime(timestamp, '-4 hours')) as et_day,
+                           SUM(CASE WHEN activity_type='BUY' THEN 1 ELSE 0 END) as buy_count,
+                           SUM(CASE WHEN activity_type='SELL' THEN 1 ELSE 0 END) as sell_count,
+                           ROUND(AVG(CASE WHEN activity_type='BUY' THEN boost END), 2) as avg_boost_buy,
+                           ROUND(AVG(CASE WHEN activity_type='SELL' THEN boost END), 2) as avg_boost_sell
+                    FROM signals
+                    WHERE date(datetime(timestamp, '-4 hours')) >= ?
+                      AND date(datetime(timestamp, '-4 hours')) < ?
+                    GROUP BY et_day ORDER BY et_day
+                    """,
+                    (rs, today),
+                ).fetchall()
+
+                perf_rows = conn.execute(
+                    """
+                    SELECT et_day,
+                           ROUND(AVG(CASE WHEN activity_type='BUY' AND direction_correct IS NOT NULL
+                               THEN CAST(direction_correct AS FLOAT) END)*100, 1) as win_rate_buy,
+                           ROUND(AVG(CASE WHEN activity_type='SELL' AND direction_correct IS NOT NULL
+                               THEN CAST(direction_correct AS FLOAT) END)*100, 1) as win_rate_sell,
+                           ROUND(AVG(CASE WHEN activity_type='BUY' THEN first_call_efficiency_pct END), 2) as avg_eff_buy,
+                           ROUND(AVG(CASE WHEN activity_type='SELL' THEN first_call_efficiency_pct END), 2) as avg_eff_sell,
+                           MAX(CASE WHEN dq_eod_missing=0 THEN 1 ELSE 0 END) as eod_filled
+                    FROM daily_calls
+                    WHERE et_day >= ? AND et_day < ?
+                    GROUP BY et_day
+                    """,
+                    (rs, today),
+                ).fetchall()
+            else:
+                vol_rows = conn.execute(
+                    """
+                    SELECT date(datetime(timestamp, '-4 hours')) as et_day,
+                           SUM(CASE WHEN activity_type='BUY' THEN 1 ELSE 0 END) as buy_count,
+                           SUM(CASE WHEN activity_type='SELL' THEN 1 ELSE 0 END) as sell_count,
+                           ROUND(AVG(CASE WHEN activity_type='BUY' THEN boost END), 2) as avg_boost_buy,
+                           ROUND(AVG(CASE WHEN activity_type='SELL' THEN boost END), 2) as avg_boost_sell
+                    FROM signals
+                    WHERE date(datetime(timestamp, '-4 hours')) < ?
+                    GROUP BY et_day ORDER BY et_day
+                    """,
+                    (today,),
+                ).fetchall()
+
+                perf_rows = conn.execute(
+                    """
+                    SELECT et_day,
+                           ROUND(AVG(CASE WHEN activity_type='BUY' AND direction_correct IS NOT NULL
+                               THEN CAST(direction_correct AS FLOAT) END)*100, 1) as win_rate_buy,
+                           ROUND(AVG(CASE WHEN activity_type='SELL' AND direction_correct IS NOT NULL
+                               THEN CAST(direction_correct AS FLOAT) END)*100, 1) as win_rate_sell,
+                           ROUND(AVG(CASE WHEN activity_type='BUY' THEN first_call_efficiency_pct END), 2) as avg_eff_buy,
+                           ROUND(AVG(CASE WHEN activity_type='SELL' THEN first_call_efficiency_pct END), 2) as avg_eff_sell,
+                           MAX(CASE WHEN dq_eod_missing=0 THEN 1 ELSE 0 END) as eod_filled
+                    FROM daily_calls
+                    WHERE et_day < ?
+                    GROUP BY et_day
+                    """,
+                    (today,),
+                ).fetchall()
+
+            perf_map = {r["et_day"]: r for r in perf_rows}
+
+            days = []
+            for v in vol_rows:
+                day = v["et_day"]
+                p = perf_map.get(day)
+                buy_count = v["buy_count"]
+                sell_count = v["sell_count"]
+                buy_sell_ratio = (
+                    round(buy_count / sell_count, 2) if sell_count else None
+                )
+                days.append({
+                    "et_day": day,
+                    "buy_count": buy_count,
+                    "sell_count": sell_count,
+                    "avg_boost_buy": v["avg_boost_buy"],
+                    "avg_boost_sell": v["avg_boost_sell"],
+                    "buy_sell_ratio": buy_sell_ratio,
+                    "win_rate_buy": p["win_rate_buy"] if p else None,
+                    "win_rate_sell": p["win_rate_sell"] if p else None,
+                    "avg_efficiency_buy": p["avg_eff_buy"] if p else None,
+                    "avg_efficiency_sell": p["avg_eff_sell"] if p else None,
+                    "eod_filled": bool(p["eod_filled"]) if p else False,
+                })
+
+            pending_backfill = any(not d["eod_filled"] for d in days)
+
+            return {"range": range, "pending_backfill": pending_backfill, "days": days}
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("analytics/daily-trend error")
+        raise HTTPException(status_code=500, detail="Analytics error")
+
+
+# ---------------------------------------------------------------------------
+# 5. GET /api/analytics/boost-hour-scatter?range=7d&activity_type=ALL
+# ---------------------------------------------------------------------------
+
+@router.get("/analytics/boost-hour-scatter")
+def analytics_boost_hour_scatter(
+    range: str = Query("7d"),
+    activity_type: str = Query("ALL"),
+):
+    try:
+        range = _validate_range(range)
+        if activity_type not in ("BUY", "SELL", "ALL"):
+            activity_type = "ALL"
+        today = _today_et()
+        rs = _range_start(range, today)
+
+        conn = _get_conn()
+        try:
+            # Build WHERE clauses
+            if rs is not None:
+                where_date = (
+                    "date(datetime(timestamp, '-4 hours')) >= ? "
+                    "AND date(datetime(timestamp, '-4 hours')) < ?"
+                )
+                base_params: list = [rs, today]
+            else:
+                where_date = "date(datetime(timestamp, '-4 hours')) < ?"
+                base_params = [today]
+
+            if activity_type != "ALL":
+                where_at = "AND activity_type = ?"
+                count_params = base_params + [activity_type]
+            else:
+                where_at = ""
+                count_params = base_params
+
+            count_sql = (
+                f"SELECT COUNT(*) FROM signals "
+                f"WHERE {where_date} {where_at} AND boost IS NOT NULL"
+            )
+            total_before_cap = conn.execute(count_sql, count_params).fetchone()[0]
+
+            scatter_sql = (
+                f"SELECT CAST(strftime('%H', datetime(timestamp, '-4 hours')) AS INT) as hour_et, "
+                f"boost, activity_type "
+                f"FROM signals "
+                f"WHERE {where_date} {where_at} AND boost IS NOT NULL "
+                f"ORDER BY RANDOM() LIMIT 1500"
+            )
+            rows = conn.execute(scatter_sql, count_params).fetchall()
+
+            points = [
+                {"hour_et": r["hour_et"], "boost": r["boost"], "activity_type": r["activity_type"]}
+                for r in rows
+            ]
+
+            return {
+                "range": range,
+                "activity_type": activity_type,
+                "total_before_cap": total_before_cap,
+                "capped": total_before_cap > 1500,
+                "points": points,
+            }
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("analytics/boost-hour-scatter error")
+        raise HTTPException(status_code=500, detail="Analytics error")
+
+
+# ---------------------------------------------------------------------------
+# 6. GET /api/analytics/streak-leaderboard
+# ---------------------------------------------------------------------------
+
+@router.get("/analytics/streak-leaderboard")
+def analytics_streak_leaderboard():
+    try:
+        today = _today_et()
+        conn = _get_conn()
+        try:
+            # All (ticker, et_day) sorted DESC for streak computation
+            summary_rows = conn.execute(
+                "SELECT ticker, et_day FROM daily_signal_summary "
+                "WHERE et_day < ? ORDER BY ticker, et_day DESC",
+                (today,),
+            ).fetchall()
+
+            # Group et_days per ticker
+            from collections import defaultdict
+            ticker_days: dict[str, list[str]] = defaultdict(list)
+            for r in summary_rows:
+                ticker_days[r["ticker"]].append(r["et_day"])
+
+            # Compute streak: consecutive days ending at the most recent
+            def _streak(days: list[str]) -> int:
+                if not days:
+                    return 0
+                streak = 1
+                for i in range(1, len(days)):
+                    prev = datetime.strptime(days[i - 1], "%Y-%m-%d")
+                    curr = datetime.strptime(days[i], "%Y-%m-%d")
+                    if (prev - curr).days == 1:
+                        streak += 1
+                    else:
+                        break
+                return streak
+
+            streaks = {t: _streak(ds) for t, ds in ticker_days.items()}
+            top15 = sorted(streaks.items(), key=lambda x: x[1], reverse=True)[:15]
+
+            # Total calls + avg boost
+            stats_rows = conn.execute(
+                "SELECT ticker, COUNT(*) as total_calls, ROUND(AVG(boost), 2) as avg_boost "
+                "FROM signals GROUP BY ticker"
+            ).fetchall()
+            stats_map = {r["ticker"]: r for r in stats_rows}
+
+            # Last seen
+            last_seen_rows = conn.execute(
+                "SELECT ticker, MAX(et_day) as last_seen FROM daily_signal_summary "
+                "WHERE et_day < ? GROUP BY ticker",
+                (today,),
+            ).fetchall()
+            last_seen_map = {r["ticker"]: r["last_seen"] for r in last_seen_rows}
+
+            leaderboard = []
+            for rank, (ticker, streak_days) in enumerate(top15, start=1):
+                s = stats_map.get(ticker)
+                leaderboard.append({
+                    "rank": rank,
+                    "ticker": ticker,
+                    "streak_days": streak_days,
+                    "total_calls_all_time": s["total_calls"] if s else 0,
+                    "avg_boost_all_time": s["avg_boost"] if s else None,
+                    "last_seen_et": last_seen_map.get(ticker),
+                })
+
+            return {"leaderboard": leaderboard}
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("analytics/streak-leaderboard error")
+        raise HTTPException(status_code=500, detail="Analytics error")
+
+
+# ---------------------------------------------------------------------------
+# 7. GET /api/analytics/accuracy-by-day?range=7d
+# ---------------------------------------------------------------------------
+
+@router.get("/analytics/accuracy-by-day")
+def analytics_accuracy_by_day(range: str = Query("7d")):
+    try:
+        range = _validate_range(range)
+        today = _today_et()
+        rs = _range_start(range, today)
+
+        conn = _get_conn()
+        try:
+            params = (rs, today) if rs is not None else (today,)
+            where = "et_day >= ? AND et_day < ?" if rs is not None else "et_day < ?"
+
+            rows = conn.execute(
+                f"""
+                SELECT et_day,
+                       ROUND(AVG(CASE WHEN activity_type='BUY' AND direction_correct IS NOT NULL
+                           THEN CAST(direction_correct AS FLOAT) END)*100, 1) as win_rate_buy,
+                       ROUND(AVG(CASE WHEN activity_type='SELL' AND direction_correct IS NOT NULL
+                           THEN CAST(direction_correct AS FLOAT) END)*100, 1) as win_rate_sell,
+                       ROUND(AVG(CASE WHEN activity_type='BUY' THEN first_call_efficiency_pct END), 2) as avg_eff_buy,
+                       ROUND(AVG(CASE WHEN activity_type='SELL' THEN first_call_efficiency_pct END), 2) as avg_eff_sell,
+                       SUM(CASE WHEN activity_type='BUY' AND direction_correct IS NOT NULL THEN 1 ELSE 0 END) as sample_size_buy,
+                       SUM(CASE WHEN activity_type='SELL' AND direction_correct IS NOT NULL THEN 1 ELSE 0 END) as sample_size_sell
+                FROM daily_calls
+                WHERE dq_eod_missing=0 AND {where}
+                GROUP BY et_day ORDER BY et_day
+                """,
+                params,
+            ).fetchall()
+
+            pending_cnt = conn.execute(
+                f"SELECT COUNT(*) FROM daily_calls WHERE dq_eod_missing=1 AND {where}",
+                params,
+            ).fetchone()[0]
+
+            has_data = len(rows) > 0
+
+            days = [
+                {
+                    "et_day": r["et_day"],
+                    "win_rate_buy": r["win_rate_buy"],
+                    "win_rate_sell": r["win_rate_sell"],
+                    "avg_efficiency_buy": r["avg_eff_buy"],
+                    "avg_efficiency_sell": r["avg_eff_sell"],
+                    "sample_size_buy": r["sample_size_buy"],
+                    "sample_size_sell": r["sample_size_sell"],
+                }
+                for r in rows
+            ]
+
+            return {
+                "range": range,
+                "pending_backfill": pending_cnt > 0,
+                "has_data": has_data,
+                "days": days,
+            }
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("analytics/accuracy-by-day error")
+        raise HTTPException(status_code=500, detail="Analytics error")
+
+
+# ---------------------------------------------------------------------------
+# 8. GET /api/analytics/accuracy-by-mcap?range=7d
+# ---------------------------------------------------------------------------
+
+@router.get("/analytics/accuracy-by-mcap")
+def analytics_accuracy_by_mcap(range: str = Query("7d")):
+    try:
+        range = _validate_range(range)
+        today = _today_et()
+        rs = _range_start(range, today)
+
+        conn = _get_conn()
+        try:
+            params = (rs, today) if rs is not None else (today,)
+            where = "et_day >= ? AND et_day < ?" if rs is not None else "et_day < ?"
+
+            rows = conn.execute(
+                f"""
+                SELECT mcap_tier,
+                       ROUND(AVG(CAST(direction_correct AS FLOAT))*100, 1) as win_rate,
+                       ROUND(AVG(first_call_efficiency_pct), 2) as avg_efficiency_pct,
+                       COUNT(*) as sample_size
+                FROM daily_calls
+                WHERE dq_eod_missing=0
+                  AND mcap_tier IS NOT NULL
+                  AND {where}
+                GROUP BY mcap_tier ORDER BY mcap_tier
+                """,
+                params,
+            ).fetchall()
+
+            pending_cnt = conn.execute(
+                f"SELECT COUNT(*) FROM daily_calls WHERE dq_eod_missing=1 AND {where}",
+                params,
+            ).fetchone()[0]
+
+            tiers = [
+                {
+                    "mcap_tier": r["mcap_tier"],
+                    "win_rate": r["win_rate"],
+                    "avg_efficiency_pct": r["avg_efficiency_pct"],
+                    "sample_size": r["sample_size"],
+                }
+                for r in rows
+            ]
+
+            return {
+                "range": range,
+                "pending_backfill": pending_cnt > 0,
+                "has_data": len(tiers) > 0,
+                "tiers": tiers,
+            }
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("analytics/accuracy-by-mcap error")
+        raise HTTPException(status_code=500, detail="Analytics error")

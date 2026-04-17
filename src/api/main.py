@@ -13,7 +13,7 @@ from sqlmodel import text
 load_dotenv()
 
 from src.schema import get_engine
-from src.api.routes import signals, health, metrics, analytics
+from src.api.routes import signals, health, metrics, analytics, backfill
 
 
 # ---------------------------------------------------------------------------
@@ -76,3 +76,4 @@ app.include_router(signals.router, prefix="/api")
 app.include_router(health.router)
 app.include_router(metrics.router, prefix="/api")
 app.include_router(analytics.router, prefix="/api")
+app.include_router(backfill.router, prefix="/api")
