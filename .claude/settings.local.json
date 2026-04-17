@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/backfill_eod.py'\\).read\\(\\)\\); ast.parse\\(open\\('src/api/routes/analytics.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
+    ]
+  }
+}

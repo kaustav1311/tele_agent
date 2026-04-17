@@ -1,10 +1,11 @@
 # src/api/routes/analytics.py
-# Analytics endpoints — summary cards, trends, accuracy, scatter, leaderboard.
+# Analytics endpoints — summary cards, trends, accuracy, hourly volume, leaderboard, today.
 
 import os
+import builtins
 import sqlite3
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
@@ -158,7 +159,7 @@ def analytics_summary_cards(range: str = Query("7d")):
 
             total_buy = buy_row["cnt"] if buy_row else 0
             total_sell = sell_row["cnt"] if sell_row else 0
-            buy_sell_ratio = round(total_buy / total_sell, 2) if total_sell else None
+            buy_sell_ratio = builtins.round(total_buy / total_sell, 2) if total_sell else None
 
             # avg_calls_per_ticker from daily_calls
             if rs is not None:
@@ -187,7 +188,7 @@ def analytics_summary_cards(range: str = Query("7d")):
             total_signals = total_buy + total_sell
             days = _days_in_range(range) if range != "all" else None
             if days:
-                velocity = round(total_signals / (days * 24.0), 1)
+                velocity = builtins.round(total_signals / (days * 24.0), 1)
             else:
                 velocity = None
 
@@ -271,7 +272,7 @@ def analytics_timezone_activity(range: str = Query("7d")):
                     "buy_new_tickers": buy_map.get(h, 0),
                     "sell_new_tickers": sell_map.get(h, 0),
                 }
-                for h in range(24)
+                for h in builtins.range(24)
             ]
 
             return {"range": range, "hours": hours}
@@ -370,7 +371,7 @@ def analytics_daily_trend(range: str = Query("7d")):
                 buy_count = v["buy_count"]
                 sell_count = v["sell_count"]
                 buy_sell_ratio = (
-                    round(buy_count / sell_count, 2) if sell_count else None
+                    builtins.round(buy_count / sell_count, 2) if sell_count else None
                 )
                 days.append({
                     "et_day": day,
@@ -399,74 +400,71 @@ def analytics_daily_trend(range: str = Query("7d")):
 
 
 # ---------------------------------------------------------------------------
-# 5. GET /api/analytics/boost-hour-scatter?range=7d&activity_type=ALL
+# 5. GET /api/analytics/boost-hour-scatter?range=7d
+# (Route path retained; handler now returns hourly stacked BUY/SELL volume.)
 # ---------------------------------------------------------------------------
 
 @router.get("/analytics/boost-hour-scatter")
-def analytics_boost_hour_scatter(
-    range: str = Query("7d"),
-    activity_type: str = Query("ALL"),
-):
+def analytics_hourly_volume(range: str = Query("7d")):
     try:
         range = _validate_range(range)
-        if activity_type not in ("BUY", "SELL", "ALL"):
-            activity_type = "ALL"
         today = _today_et()
         rs = _range_start(range, today)
 
         conn = _get_conn()
         try:
-            # Build WHERE clauses
             if rs is not None:
-                where_date = (
-                    "date(datetime(timestamp, '-4 hours')) >= ? "
-                    "AND date(datetime(timestamp, '-4 hours')) < ?"
-                )
-                base_params: list = [rs, today]
+                sql = """
+                    SELECT
+                      CAST(strftime('%H', datetime(timestamp, '-4 hours')) AS INT) as hour_et,
+                      SUM(CASE WHEN activity_type='BUY' THEN 1 ELSE 0 END) as buy_count,
+                      SUM(CASE WHEN activity_type='SELL' THEN 1 ELSE 0 END) as sell_count
+                    FROM signals
+                    WHERE date(datetime(timestamp, '-4 hours')) >= ?
+                      AND date(datetime(timestamp, '-4 hours')) < ?
+                    GROUP BY hour_et
+                """
+                params: tuple = (rs, today)
             else:
-                where_date = "date(datetime(timestamp, '-4 hours')) < ?"
-                base_params = [today]
+                sql = """
+                    SELECT
+                      CAST(strftime('%H', datetime(timestamp, '-4 hours')) AS INT) as hour_et,
+                      SUM(CASE WHEN activity_type='BUY' THEN 1 ELSE 0 END) as buy_count,
+                      SUM(CASE WHEN activity_type='SELL' THEN 1 ELSE 0 END) as sell_count
+                    FROM signals
+                    WHERE date(datetime(timestamp, '-4 hours')) < ?
+                    GROUP BY hour_et
+                """
+                params = (today,)
 
-            if activity_type != "ALL":
-                where_at = "AND activity_type = ?"
-                count_params = base_params + [activity_type]
-            else:
-                where_at = ""
-                count_params = base_params
+            raw = {r["hour_et"]: r for r in conn.execute(sql, params).fetchall()}
 
-            count_sql = (
-                f"SELECT COUNT(*) FROM signals "
-                f"WHERE {where_date} {where_at} AND boost IS NOT NULL"
-            )
-            total_before_cap = conn.execute(count_sql, count_params).fetchone()[0]
+            hours = []
+            for h in builtins.range(24):
+                r = raw.get(h)
+                bc = (r["buy_count"] if r else 0) or 0
+                sc = (r["sell_count"] if r else 0) or 0
+                total = bc + sc
+                buy_pct = builtins.round(bc / total * 100, 1) if total else 0.0
+                sell_pct = builtins.round(sc / total * 100, 1) if total else 0.0
+                bsr = builtins.round(bc / sc, 2) if sc else None
+                hours.append({
+                    "hour_et": h,
+                    "buy_count": bc,
+                    "sell_count": sc,
+                    "total": total,
+                    "buy_pct": buy_pct,
+                    "sell_pct": sell_pct,
+                    "buy_sell_ratio": bsr,
+                })
 
-            scatter_sql = (
-                f"SELECT CAST(strftime('%H', datetime(timestamp, '-4 hours')) AS INT) as hour_et, "
-                f"boost, activity_type "
-                f"FROM signals "
-                f"WHERE {where_date} {where_at} AND boost IS NOT NULL "
-                f"ORDER BY RANDOM() LIMIT 1500"
-            )
-            rows = conn.execute(scatter_sql, count_params).fetchall()
-
-            points = [
-                {"hour_et": r["hour_et"], "boost": r["boost"], "activity_type": r["activity_type"]}
-                for r in rows
-            ]
-
-            return {
-                "range": range,
-                "activity_type": activity_type,
-                "total_before_cap": total_before_cap,
-                "capped": total_before_cap > 1500,
-                "points": points,
-            }
+            return {"range": range, "hours": hours}
         finally:
             conn.close()
     except HTTPException:
         raise
     except Exception:
-        logger.exception("analytics/boost-hour-scatter error")
+        logger.exception("analytics/hourly-volume error")
         raise HTTPException(status_code=500, detail="Analytics error")
 
 
@@ -498,7 +496,7 @@ def analytics_streak_leaderboard():
                 if not days:
                     return 0
                 streak = 1
-                for i in range(1, len(days)):
+                for i in builtins.range(1, len(days)):
                     prev = datetime.strptime(days[i - 1], "%Y-%m-%d")
                     curr = datetime.strptime(days[i], "%Y-%m-%d")
                     if (prev - curr).days == 1:
@@ -572,6 +570,8 @@ def analytics_accuracy_by_day(range: str = Query("7d")):
                            THEN CAST(direction_correct AS FLOAT) END)*100, 1) as win_rate_sell,
                        ROUND(AVG(CASE WHEN activity_type='BUY' THEN first_call_efficiency_pct END), 2) as avg_eff_buy,
                        ROUND(AVG(CASE WHEN activity_type='SELL' THEN first_call_efficiency_pct END), 2) as avg_eff_sell,
+                       ROUND(AVG(CASE WHEN activity_type='BUY' THEN time_weighted_accuracy END), 3) as twa_buy,
+                       ROUND(AVG(CASE WHEN activity_type='SELL' THEN time_weighted_accuracy END), 3) as twa_sell,
                        SUM(CASE WHEN activity_type='BUY' AND direction_correct IS NOT NULL THEN 1 ELSE 0 END) as sample_size_buy,
                        SUM(CASE WHEN activity_type='SELL' AND direction_correct IS NOT NULL THEN 1 ELSE 0 END) as sample_size_sell
                 FROM daily_calls
@@ -581,9 +581,19 @@ def analytics_accuracy_by_day(range: str = Query("7d")):
                 params,
             ).fetchall()
 
+            # pending_backfill: a day counts as "pending" only when it has BOTH
+            # filled and unfilled rows (partial backfill). Days with no filled
+            # rows at all are surfaced as "no data" instead of "pending".
             pending_cnt = conn.execute(
-                f"SELECT COUNT(*) FROM daily_calls WHERE dq_eod_missing=1 AND {where}",
-                params,
+                f"""
+                SELECT COUNT(DISTINCT et_day) FROM daily_calls
+                WHERE dq_eod_missing=1 AND {where}
+                  AND et_day IN (
+                    SELECT DISTINCT et_day FROM daily_calls
+                    WHERE dq_eod_missing=0 AND {where}
+                  )
+                """,
+                params + params,
             ).fetchone()[0]
 
             has_data = len(rows) > 0
@@ -595,6 +605,8 @@ def analytics_accuracy_by_day(range: str = Query("7d")):
                     "win_rate_sell": r["win_rate_sell"],
                     "avg_efficiency_buy": r["avg_eff_buy"],
                     "avg_efficiency_sell": r["avg_eff_sell"],
+                    "twa_buy": r["twa_buy"],
+                    "twa_sell": r["twa_sell"],
                     "sample_size_buy": r["sample_size_buy"],
                     "sample_size_sell": r["sample_size_sell"],
                 }
@@ -637,6 +649,7 @@ def analytics_accuracy_by_mcap(range: str = Query("7d")):
                 SELECT mcap_tier,
                        ROUND(AVG(CAST(direction_correct AS FLOAT))*100, 1) as win_rate,
                        ROUND(AVG(first_call_efficiency_pct), 2) as avg_efficiency_pct,
+                       ROUND(AVG(time_weighted_accuracy), 3) as twa,
                        COUNT(*) as sample_size
                 FROM daily_calls
                 WHERE dq_eod_missing=0
@@ -647,9 +660,17 @@ def analytics_accuracy_by_mcap(range: str = Query("7d")):
                 params,
             ).fetchall()
 
+            # Same partial-backfill semantics as accuracy-by-day.
             pending_cnt = conn.execute(
-                f"SELECT COUNT(*) FROM daily_calls WHERE dq_eod_missing=1 AND {where}",
-                params,
+                f"""
+                SELECT COUNT(DISTINCT et_day) FROM daily_calls
+                WHERE dq_eod_missing=1 AND {where}
+                  AND et_day IN (
+                    SELECT DISTINCT et_day FROM daily_calls
+                    WHERE dq_eod_missing=0 AND {where}
+                  )
+                """,
+                params + params,
             ).fetchone()[0]
 
             tiers = [
@@ -657,6 +678,7 @@ def analytics_accuracy_by_mcap(range: str = Query("7d")):
                     "mcap_tier": r["mcap_tier"],
                     "win_rate": r["win_rate"],
                     "avg_efficiency_pct": r["avg_efficiency_pct"],
+                    "twa": r["twa"],
                     "sample_size": r["sample_size"],
                 }
                 for r in rows
@@ -674,4 +696,124 @@ def analytics_accuracy_by_mcap(range: str = Query("7d")):
         raise
     except Exception:
         logger.exception("analytics/accuracy-by-mcap error")
+        raise HTTPException(status_code=500, detail="Analytics error")
+
+
+# ---------------------------------------------------------------------------
+# 9. GET /api/analytics/today
+# Live intraday signal stats — sourced from signals table only.
+# ---------------------------------------------------------------------------
+
+@router.get("/analytics/today")
+def analytics_today():
+    try:
+        today = _today_et()
+        conn = _get_conn()
+        try:
+            rows = conn.execute(
+                """
+                SELECT
+                  CAST(strftime('%H', datetime(timestamp, '-4 hours')) AS INT) as hour_et,
+                  SUM(CASE WHEN activity_type='BUY' THEN 1 ELSE 0 END) as buy_count,
+                  SUM(CASE WHEN activity_type='SELL' THEN 1 ELSE 0 END) as sell_count,
+                  ROUND(AVG(CASE WHEN activity_type='BUY' THEN boost END), 2) as avg_boost_buy,
+                  ROUND(AVG(CASE WHEN activity_type='SELL' THEN boost END), 2) as avg_boost_sell
+                FROM signals
+                WHERE date(datetime(timestamp, '-4 hours')) = ?
+                GROUP BY hour_et ORDER BY hour_et
+                """,
+                (today,),
+            ).fetchall()
+
+            by_hour = []
+            total_buy = 0
+            total_sell = 0
+            # Weighted sums for overall boost averages across the whole day.
+            w_boost_buy_num = 0.0
+            w_boost_buy_den = 0
+            w_boost_sell_num = 0.0
+            w_boost_sell_den = 0
+            most_active_hour = None
+            most_active_count = -1
+
+            for r in rows:
+                bc = r["buy_count"] or 0
+                sc = r["sell_count"] or 0
+                bsr = builtins.round(bc / sc, 2) if sc else None
+                by_hour.append({
+                    "hour_et": r["hour_et"],
+                    "buy_count": bc,
+                    "sell_count": sc,
+                    "buy_sell_ratio": bsr,
+                    "avg_boost_buy": r["avg_boost_buy"],
+                    "avg_boost_sell": r["avg_boost_sell"],
+                })
+                total_buy += bc
+                total_sell += sc
+                if r["avg_boost_buy"] is not None and bc:
+                    w_boost_buy_num += r["avg_boost_buy"] * bc
+                    w_boost_buy_den += bc
+                if r["avg_boost_sell"] is not None and sc:
+                    w_boost_sell_num += r["avg_boost_sell"] * sc
+                    w_boost_sell_den += sc
+                hour_total = bc + sc
+                if hour_total > most_active_count:
+                    most_active_count = hour_total
+                    most_active_hour = r["hour_et"]
+
+            # Unique ticker counts for BUY vs SELL today.
+            uniq_rows = conn.execute(
+                """
+                SELECT activity_type, COUNT(DISTINCT ticker) as cnt
+                FROM signals
+                WHERE date(datetime(timestamp, '-4 hours')) = ?
+                GROUP BY activity_type
+                """,
+                (today,),
+            ).fetchall()
+            uniq_map = {r["activity_type"]: r["cnt"] for r in uniq_rows}
+
+            hours_active = len(by_hour)
+            total_signals = total_buy + total_sell
+            velocity = (
+                builtins.round(total_signals / hours_active, 2) if hours_active else 0
+            )
+
+            avg_boost_buy = (
+                builtins.round(w_boost_buy_num / w_boost_buy_den, 2)
+                if w_boost_buy_den else None
+            )
+            avg_boost_sell = (
+                builtins.round(w_boost_sell_num / w_boost_sell_den, 2)
+                if w_boost_sell_den else None
+            )
+            buy_sell_ratio = (
+                builtins.round(total_buy / total_sell, 2) if total_sell else None
+            )
+
+            summary = {
+                "total_buy_signals": total_buy,
+                "total_sell_signals": total_sell,
+                "unique_tickers_buy": uniq_map.get("BUY", 0),
+                "unique_tickers_sell": uniq_map.get("SELL", 0),
+                "avg_boost_buy": avg_boost_buy,
+                "avg_boost_sell": avg_boost_sell,
+                "buy_sell_ratio": buy_sell_ratio,
+                "signal_velocity_per_hour": velocity,
+                "most_active_hour_et": most_active_hour,
+                "hours_active": hours_active,
+            }
+
+            return {
+                "et_day": today,
+                "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                "summary": summary,
+                "by_hour": by_hour,
+            }
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("analytics/today error")
         raise HTTPException(status_code=500, detail="Analytics error")

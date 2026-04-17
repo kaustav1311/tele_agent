@@ -14,7 +14,8 @@ def run_eod_backfill(et_day: str) -> dict:
     """
     Fetch EOD close prices for all tickers in daily_calls for et_day.
     Updates eod_price, eod_fetched_at, first_call_efficiency_pct,
-    last_call_efficiency_pct, direction_correct, dq_eod_missing.
+    last_call_efficiency_pct, direction_correct, time_weighted_accuracy,
+    dq_eod_missing.
     Does NOT overwrite intraday_drift_pct.
     Returns {et_day, updated, failed, skipped_no_price, skipped_dq_first_missing}
     """
@@ -26,6 +27,17 @@ def run_eod_backfill(et_day: str) -> dict:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
+    # Lazily ensure the time_weighted_accuracy column exists.
+    # Safe to run on every invocation (idempotent via try/except).
+    try:
+        conn.execute(
+            "ALTER TABLE daily_calls ADD COLUMN time_weighted_accuracy REAL DEFAULT NULL"
+        )
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
+
     updated = 0
     failed = 0
     skipped_no_price = 0
@@ -35,7 +47,7 @@ def run_eod_backfill(et_day: str) -> dict:
         rows = conn.execute(
             """
             SELECT id, ticker, activity_type, first_call_price, last_call_price,
-                   dq_first_price_missing
+                   first_call_time_et, dq_first_price_missing
             FROM daily_calls
             WHERE et_day = ? AND dq_eod_missing = 1
             """,
@@ -101,6 +113,7 @@ def run_eod_backfill(et_day: str) -> dict:
 
                 first_price = row["first_call_price"]
                 last_price = row["last_call_price"]
+                first_call_time_et = row["first_call_time_et"]
 
                 first_eff = (
                     round((eod_price - first_price) / first_price * 100, 4)
@@ -122,12 +135,28 @@ def run_eod_backfill(et_day: str) -> dict:
                 else:
                     direction_correct = None
 
+                # Time-weighted accuracy: rewards early correct calls, penalizes
+                # late wrong calls least. first_call_time_et is "HH:MM" ET.
+                try:
+                    hour = int(first_call_time_et[:2]) if first_call_time_et else 12
+                except (ValueError, TypeError):
+                    hour = 12
+                hours_remaining = 24 - hour
+                weight = hours_remaining / 24.0
+                if direction_correct is not None:
+                    time_weighted_accuracy = round(
+                        weight if direction_correct == 1 else (1.0 - weight), 4
+                    )
+                else:
+                    time_weighted_accuracy = None
+
                 conn.execute(
                     """
                     UPDATE daily_calls
                     SET eod_price=?, eod_fetched_at=?,
                         first_call_efficiency_pct=?, last_call_efficiency_pct=?,
-                        direction_correct=?, dq_eod_missing=0
+                        direction_correct=?, time_weighted_accuracy=?,
+                        dq_eod_missing=0
                     WHERE id=?
                     """,
                     (
@@ -136,6 +165,7 @@ def run_eod_backfill(et_day: str) -> dict:
                         first_eff,
                         last_eff,
                         direction_correct,
+                        time_weighted_accuracy,
                         row["id"],
                     ),
                 )
