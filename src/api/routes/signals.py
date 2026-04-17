@@ -55,6 +55,7 @@ def _format_signal(row, has_conflicting_activity: bool = False) -> dict:
     ts_utc = _parse_ts(row["timestamp"])
     created_at = _parse_ts(row["created_at"])
     first_call_ts_utc = _parse_ts(row["first_call_time_utc"])
+    last_call_ts_utc = _parse_ts(row["last_call_time_utc"])
 
     return {
         "message_id":               row["message_id"],
@@ -74,9 +75,9 @@ def _format_signal(row, has_conflicting_activity: bool = False) -> dict:
         "call_count":               row["call_count"],
         "has_conflicting_activity": has_conflicting_activity,
         "first_call_price":         row["first_call_price"],
-        "last_call_price":          row["price_at_signal"],  # latest signal in window
+        "last_call_price":          row["last_call_price"],
         "first_call_time_utc":      first_call_ts_utc.isoformat() if first_call_ts_utc else None,
-        "last_call_time_utc":       ts_utc.isoformat() if ts_utc else None,
+        "last_call_time_utc":       last_call_ts_utc.isoformat() if last_call_ts_utc else None,
     }
 
 
@@ -93,7 +94,28 @@ SQL = """
         FROM (
             SELECT
                 s.ticker, s.activity_type, s.timestamp, s.price_at_signal,
-                ROW_NUMBER() OVER (PARTITION BY s.ticker, s.activity_type ORDER BY s.timestamp ASC) as rn
+                ROW_NUMBER() OVER (
+                    PARTITION BY s.ticker, s.activity_type
+                    ORDER BY
+                        CASE WHEN s.price_at_signal IS NOT NULL AND s.price_at_signal > 0 THEN 0 ELSE 1 END ASC,
+                        s.timestamp ASC
+                ) as rn
+            FROM signals s
+            WHERE s.timestamp >= ?
+        )
+        WHERE rn = 1
+    ),
+    last_calls AS (
+        SELECT ticker, activity_type, timestamp as last_call_timestamp, price_at_signal as last_call_price
+        FROM (
+            SELECT
+                s.ticker, s.activity_type, s.timestamp, s.price_at_signal,
+                ROW_NUMBER() OVER (
+                    PARTITION BY s.ticker, s.activity_type
+                    ORDER BY
+                        CASE WHEN s.price_at_signal IS NOT NULL AND s.price_at_signal > 0 THEN 0 ELSE 1 END ASC,
+                        s.timestamp DESC
+                ) as rn
             FROM signals s
             WHERE s.timestamp >= ?
         )
@@ -110,10 +132,14 @@ SQL = """
          AND activity_type = rs.activity_type
          AND timestamp >= ?) AS call_count,
         fc.first_call_price,
-        fc.first_call_timestamp as first_call_time_utc
+        fc.first_call_timestamp as first_call_time_utc,
+        lc.last_call_price,
+        lc.last_call_timestamp as last_call_time_utc
     FROM ranked_signals rs
     LEFT JOIN first_calls fc ON fc.ticker = rs.ticker
         AND fc.activity_type = rs.activity_type
+    LEFT JOIN last_calls lc ON lc.ticker = rs.ticker
+        AND lc.activity_type = rs.activity_type
     WHERE rs.rn = 1
     ORDER BY rs.boost DESC, rs.timestamp DESC
 """
@@ -150,7 +176,7 @@ def signals_summary():
             windows = {}
             for tf in TIMEFRAMES:
                 candle_start_str = candle_starts[tf].strftime("%Y-%m-%d %H:%M:%S")
-                cursor = conn.execute(SQL, (candle_start_str, candle_start_str, candle_start_str))
+                cursor = conn.execute(SQL, (candle_start_str, candle_start_str, candle_start_str, candle_start_str))
                 rows = cursor.fetchall()
 
                 # Build set of tickers that have both BUY and SELL in this timeframe
