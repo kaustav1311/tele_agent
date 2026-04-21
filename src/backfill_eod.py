@@ -71,12 +71,12 @@ def run_eod_backfill(et_day: str) -> dict:
                     "limit": 1,
                     "toTs": to_ts,
                 }
-                if api_key:
-                    params["api_key"] = api_key
+                headers = {"authorization": api_key} if api_key else {}
 
                 resp = httpx.get(
                     "https://min-api.cryptocompare.com/data/histoday",
                     params=params,
+                    headers=headers,
                     timeout=10,
                 )
                 data = resp.json()

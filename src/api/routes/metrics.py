@@ -165,10 +165,9 @@ def _fetch_mcap_from_cryptocompare(tickers: list) -> dict:
             "fsyms": ",".join(tickers),
             "tsyms": "USD",
         }
-        if api_key:
-            params["api_key"] = api_key
+        headers = {"authorization": api_key} if api_key else {}
 
-        response = httpx.get(url, params=params, timeout=10)
+        response = httpx.get(url, params=params, headers=headers, timeout=10)
         response.raise_for_status()
         data = response.json()
 

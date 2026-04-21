@@ -1,8 +1,11 @@
 # src/api/main.py
 # FastAPI app — includes all routers, CORS, auth middleware, WAL mode on startup.
 
+import logging
 import os
 from contextlib import asynccontextmanager
+
+logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -22,10 +25,19 @@ from src.api.routes import signals, health, metrics, analytics, backfill
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if os.environ.get("AUTH_ENABLED", "true").lower() != "false" \
+            and not os.environ.get("SIGNAL_API_KEY", ""):
+        raise RuntimeError("SIGNAL_API_KEY must be set when AUTH_ENABLED=true")
+
     db_path = os.environ.get("DB_PATH", "data/signals.db")
     engine  = get_engine(db_path)
     with engine.connect() as conn:
         conn.execute(text("PRAGMA journal_mode=WAL"))
+        result = conn.execute(text("PRAGMA journal_mode")).scalar()
+        if result != "wal":
+            logger.warning("WAL mode not active — got: %s", result)
+        else:
+            logger.info("WAL mode confirmed")
         conn.commit()
     yield
 
@@ -39,7 +51,7 @@ app = FastAPI(title="Signal Agent API", version="0.1.0", lifespan=lifespan)
 # CORS — allow all in Phase 1 local; tighten to VPS origin in Phase 2
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )

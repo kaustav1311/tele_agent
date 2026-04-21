@@ -7,9 +7,11 @@ from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
 from sqlmodel import create_engine
 
+import logging
 import os
-import traceback
 import sqlite3
+
+logger = logging.getLogger(__name__)
 
 ET  = ZoneInfo("America/New_York")
 IST = ZoneInfo("Asia/Kolkata")
@@ -210,9 +212,9 @@ def signals_summary():
             "windows":        windows,
         }
 
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("signals error")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/signals/prev-day")
@@ -388,6 +390,6 @@ def signals_prev_day(
         finally:
             conn.close()
 
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("signals error")
+        raise HTTPException(status_code=500, detail="Internal server error")
