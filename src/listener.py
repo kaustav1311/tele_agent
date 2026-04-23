@@ -6,7 +6,7 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -18,6 +18,8 @@ from apscheduler.triggers.cron import CronTrigger
 
 from src.parser import parse, ParserError
 from src.backfill_eod import run_eod_backfill
+from src.portflow.db import init_portflow_db
+from src.portflow.ta_engine import refresh_all_tickers
 from src.schema import (
     Signal,
     UnparsedMessage,
@@ -174,7 +176,6 @@ async def backfill(client: TelegramClient, session, engine, channel):
 
 def _prev_et_day() -> str:
     """Returns the previous ET calendar day as YYYY-MM-DD string."""
-    from datetime import timedelta
     et_now = datetime.now(ZoneInfo("America/New_York"))
     prev = et_now - timedelta(days=1)
     return prev.strftime("%Y-%m-%d")
@@ -223,8 +224,21 @@ async def main():
             replace_existing=True,
             misfire_grace_time=300,   # allow up to 5min late if listener was down
         )
+
+        # Portflow watchlist TA refresh (separate SQLite file).
+        # Init here too so listener can run before API has ever started.
+        init_portflow_db()
+        scheduler.add_job(
+            refresh_all_tickers,
+            trigger="interval",
+            minutes=10,
+            id="portflow_ta_refresh",
+            replace_existing=True,
+            next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2),
+        )
+
         scheduler.start()
-        logger.info("APScheduler started: EOD backfill scheduled at 00:05 ET daily")
+        logger.info("APScheduler started: EOD backfill at 00:05 ET, portflow TA refresh every 10min")
 
         # Live listener — fires on every new message in channel
         @client.on(events.NewMessage(chats=channel))

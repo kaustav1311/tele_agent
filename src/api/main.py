@@ -16,6 +16,8 @@ from sqlmodel import text
 load_dotenv()
 
 from src.schema import get_engine
+from src.portflow.db import init_portflow_db
+from src.portflow.router import router as portflow_router
 from src.api.routes import signals, health, metrics, analytics, backfill
 
 
@@ -39,6 +41,9 @@ async def lifespan(app: FastAPI):
         else:
             logger.info("WAL mode confirmed")
         conn.commit()
+
+    init_portflow_db()
+    logger.info("portflow.db initialized")
     yield
 
 
@@ -89,3 +94,4 @@ app.include_router(health.router)
 app.include_router(metrics.router, prefix="/api")
 app.include_router(analytics.router, prefix="/api")
 app.include_router(backfill.router, prefix="/api")
+app.include_router(portflow_router, prefix="/api")
