@@ -1,58 +1,139 @@
 # src/portflow/badges.py
 # Pure badge computer. Consumes two rows from watchlist_rsi_state (father, son)
-# and returns {badge_name, icon, color}. No DB writes — computed fresh on read.
+# and returns badge dict with full metadata. No DB writes — computed fresh on read.
+#
+# RULE PRIORITY ORDER (first match wins):
+#   1. STRUCTURAL (failed_attempts >= 2 — overrides everything)
+#   2. ALIGNED (both confirmed same direction, or father confirmed + son resting)
+#   3. DIVERGENCE (confirmed opposite directions)
+#   4. EARLY (one side transitioning, other confirmed or leading)
+#   5. FORMING (early zone exits, tentative signals)
+#   6. NEUTRAL (no actionable signal)
 
 from typing import Optional
 
 from src.portflow.db import get_portflow_conn
 
 
-NEUTRAL_BADGE = {"badge_name": "NEUTRAL", "icon": "Minus", "color": "gray-500"}
-
-
-def _badge(name: str, icon: str, color: str) -> dict:
-    return {"badge_name": name, "icon": icon, "color": color}
+def _badge(name: str, icon: str, color: str,
+           father: Optional[dict] = None, son: Optional[dict] = None) -> dict:
+    """Build badge response with full metadata for frontend tooltip."""
+    return {
+        "badge_name": name,
+        "icon": icon,
+        "color": color,
+        "father_state": father.get("state") if father else None,
+        "son_state": son.get("state") if son else None,
+        "failed_attempts": int(father.get("failed_attempts_count") or 0) if father else 0,
+        "sustain_candles": int(father.get("sustain_candles_count") or 0) if father else 0,
+    }
 
 
 def compute_pair_badge(father: Optional[dict], son: Optional[dict]) -> dict:
     if not father or not son:
-        return NEUTRAL_BADGE
+        return _badge("NEUTRAL", "Minus", "gray-500")
 
     f = father.get("state")
     s = son.get("state")
     f_failed = int(father.get("failed_attempts_count") or 0)
 
-    # 1. BULL_ALIGNED
-    if f == "CONFIRMED_BULL" and s == "CONFIRMED_BULL":
-        return _badge("BULL_ALIGNED", "TrendingUp", "emerald-500")
-    # 2. BEAR_ALIGNED
-    if f == "CONFIRMED_BEAR" and s == "CONFIRMED_BEAR":
-        return _badge("BEAR_ALIGNED", "TrendingDown", "red-500")
-    # 3. EARLY_BULL
-    if f == "EXITING_LOW" and s == "CONFIRMED_BULL":
-        return _badge("EARLY_BULL", "ArrowUpRight", "emerald-400")
-    # 4. EARLY_BEAR
-    if f == "EXITING_HIGH" and s == "CONFIRMED_BEAR":
-        return _badge("EARLY_BEAR", "ArrowDownRight", "red-400")
-    # 5. BULL_FORMING
-    if f == "LOW_ZONE" and s == "EXITING_LOW":
-        return _badge("BULL_FORMING", "Sunrise", "amber-400")
-    # 6. BEAR_FORMING
-    if f == "HIGH_ZONE" and s == "EXITING_HIGH":
-        return _badge("BEAR_FORMING", "Sunset", "amber-500")
-    # 7. STRUCTURAL_BEAR — stuck in LOW with repeated failed rebounds.
-    if f == "LOW_ZONE" and f_failed >= 2:
-        return _badge("STRUCTURAL_BEAR", "TrendingDownIcon+AlertTriangle", "red-600")
-    # 8. STRUCTURAL_BULL — stuck in HIGH with repeated failed pullbacks.
-    if f == "HIGH_ZONE" and f_failed >= 2:
-        return _badge("STRUCTURAL_BULL", "TrendingUpIcon+AlertTriangle", "emerald-600")
-    # 9. DIVERGENCE — opposite CONFIRMED states across the pair.
-    if (f == "CONFIRMED_BULL" and s == "CONFIRMED_BEAR") or (
-        f == "CONFIRMED_BEAR" and s == "CONFIRMED_BULL"
-    ):
-        return _badge("DIVERGENCE", "Split", "purple-400")
+    # TIER 1: STRUCTURAL
+    if f in ("LOW_ZONE", "FAILED_BOTTOM") and f_failed >= 2:
+        return _badge("STRUCTURAL_BEAR", "TrendingDown+AlertTriangle", "red-600", father, son)
+    if f in ("HIGH_ZONE", "FAILED_TOP") and f_failed >= 2:
+        return _badge("STRUCTURAL_BULL", "TrendingUp+AlertTriangle", "emerald-600", father, son)
 
-    return NEUTRAL_BADGE
+    # TIER 2: ALIGNED
+    if f == "CONFIRMED_BULL":
+        if s in ("CONFIRMED_BULL", "EXITING_LOW", "RANGE", "HIGH_ZONE", "FAILED_TOP"):
+            return _badge("BULL_ALIGNED", "TrendingUp", "emerald-500", father, son)
+        if s in ("CONFIRMED_BEAR", "EXITING_HIGH", "LOW_ZONE", "FAILED_BOTTOM"):
+            return _badge("DIVERGENCE", "Split", "purple-400", father, son)
+
+    if f == "CONFIRMED_BEAR":
+        if s in ("CONFIRMED_BEAR", "EXITING_HIGH", "RANGE", "LOW_ZONE", "FAILED_BOTTOM"):
+            return _badge("BEAR_ALIGNED", "TrendingDown", "red-500", father, son)
+        if s in ("CONFIRMED_BULL", "EXITING_LOW", "HIGH_ZONE", "FAILED_TOP"):
+            return _badge("DIVERGENCE", "Split", "purple-400", father, son)
+
+    if f == "LOW_ZONE":
+        if s in ("LOW_ZONE", "CONFIRMED_BEAR", "FAILED_BOTTOM"):
+            return _badge("BEAR_ALIGNED", "TrendingDown", "red-500", father, son)
+        if s in ("EXITING_LOW", "CONFIRMED_BULL"):
+            return _badge("BULL_FORMING", "Sunrise", "amber-400", father, son)
+        if s in ("EXITING_HIGH", "HIGH_ZONE"):
+            return _badge("DIVERGENCE", "Split", "purple-400", father, son)
+        if s in ("RANGE", "FAILED_TOP"):
+            return _badge("NEUTRAL", "Minus", "gray-500", father, son)
+
+    if f == "HIGH_ZONE":
+        if s in ("HIGH_ZONE", "CONFIRMED_BULL", "FAILED_TOP"):
+            return _badge("BULL_ALIGNED", "TrendingUp", "emerald-500", father, son)
+        if s in ("EXITING_HIGH", "CONFIRMED_BEAR"):
+            return _badge("BEAR_FORMING", "Sunset", "amber-500", father, son)
+        if s in ("EXITING_LOW", "LOW_ZONE"):
+            return _badge("DIVERGENCE", "Split", "purple-400", father, son)
+        if s in ("RANGE", "FAILED_BOTTOM"):
+            return _badge("NEUTRAL", "Minus", "gray-500", father, son)
+
+    # TIER 3: EARLY
+    if f == "EXITING_LOW":
+        if s in ("CONFIRMED_BULL", "EXITING_LOW", "RANGE", "HIGH_ZONE", "FAILED_TOP"):
+            return _badge("EARLY_BULL", "ArrowUpRight", "emerald-400", father, son)
+        if s in ("LOW_ZONE", "FAILED_BOTTOM"):
+            return _badge("BULL_FORMING", "Sunrise", "amber-400", father, son)
+        if s in ("CONFIRMED_BEAR", "EXITING_HIGH"):
+            return _badge("DIVERGENCE", "Split", "purple-400", father, son)
+
+    if f == "EXITING_HIGH":
+        if s in ("CONFIRMED_BEAR", "EXITING_HIGH", "RANGE", "LOW_ZONE", "FAILED_BOTTOM"):
+            return _badge("EARLY_BEAR", "ArrowDownRight", "red-400", father, son)
+        if s in ("HIGH_ZONE", "FAILED_TOP"):
+            return _badge("BEAR_FORMING", "Sunset", "amber-500", father, son)
+        if s in ("CONFIRMED_BULL", "EXITING_LOW"):
+            return _badge("DIVERGENCE", "Split", "purple-400", father, son)
+
+    if f == "RANGE":
+        if s == "CONFIRMED_BULL":
+            return _badge("EARLY_BULL", "ArrowUpRight", "emerald-400", father, son)
+        if s == "CONFIRMED_BEAR":
+            return _badge("EARLY_BEAR", "ArrowDownRight", "red-400", father, son)
+        if s == "EXITING_LOW":
+            return _badge("BULL_FORMING", "Sunrise", "amber-400", father, son)
+        if s == "EXITING_HIGH":
+            return _badge("BEAR_FORMING", "Sunset", "amber-500", father, son)
+        if s == "HIGH_ZONE":
+            return _badge("EARLY_BULL", "ArrowUpRight", "emerald-400", father, son)
+        if s == "LOW_ZONE":
+            return _badge("EARLY_BEAR", "ArrowDownRight", "red-400", father, son)
+        if s == "FAILED_TOP":
+            return _badge("EARLY_BULL", "ArrowUpRight", "emerald-400", father, son)
+        if s == "FAILED_BOTTOM":
+            return _badge("EARLY_BEAR", "ArrowDownRight", "red-400", father, son)
+        if s == "RANGE":
+            return _badge("NEUTRAL", "Minus", "gray-500", father, son)
+
+    if f == "FAILED_BOTTOM":
+        if s in ("CONFIRMED_BEAR", "LOW_ZONE", "FAILED_BOTTOM"):
+            return _badge("BEAR_ALIGNED", "TrendingDown", "red-500", father, son)
+        if s in ("EXITING_LOW", "CONFIRMED_BULL"):
+            return _badge("BULL_FORMING", "Sunrise", "amber-400", father, son)
+        if s in ("EXITING_HIGH", "HIGH_ZONE"):
+            return _badge("DIVERGENCE", "Split", "purple-400", father, son)
+        if s in ("RANGE", "FAILED_TOP"):
+            return _badge("NEUTRAL", "Minus", "gray-500", father, son)
+
+    if f == "FAILED_TOP":
+        if s in ("CONFIRMED_BULL", "HIGH_ZONE", "FAILED_TOP"):
+            return _badge("BULL_ALIGNED", "TrendingUp", "emerald-500", father, son)
+        if s in ("EXITING_HIGH", "CONFIRMED_BEAR"):
+            return _badge("BEAR_FORMING", "Sunset", "amber-500", father, son)
+        if s in ("EXITING_LOW", "LOW_ZONE"):
+            return _badge("DIVERGENCE", "Split", "purple-400", father, son)
+        if s in ("RANGE", "FAILED_BOTTOM"):
+            return _badge("NEUTRAL", "Minus", "gray-500", father, son)
+
+    return _badge("NEUTRAL", "Minus", "gray-500", father, son)
 
 
 def _state_rows_for_ticker(ticker: str) -> dict:

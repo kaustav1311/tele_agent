@@ -50,6 +50,72 @@ def _load_history(ticker: str, timeframe: str) -> list:
     return [(r["candle_close_time"], float(r["rsi_value"])) for r in rows]
 
 
+def _build_segments(zones: list) -> list:
+    if not zones:
+        return []
+    segments = []
+    current_zone = zones[0]
+    start = 0
+    for i in range(1, len(zones)):
+        if zones[i] != current_zone:
+            segments.append({
+                "zone": current_zone,
+                "start": start,
+                "end": i - 1,
+                "length": i - start,
+            })
+            current_zone = zones[i]
+            start = i
+    segments.append({
+        "zone": current_zone,
+        "start": start,
+        "end": len(zones) - 1,
+        "length": len(zones) - start,
+    })
+    return segments
+
+
+def _count_failed_attempts(segments: list) -> tuple:
+    failed_bottom = 0
+    failed_top = 0
+    low_seen = 0
+    high_seen = 0
+    for seg in segments:
+        if seg["zone"] == LOW:
+            if low_seen > 0:
+                failed_bottom += 1
+            low_seen += 1
+        elif seg["zone"] == HIGH:
+            if high_seen > 0:
+                failed_top += 1
+            high_seen += 1
+    return failed_bottom, failed_top
+
+
+def _find_source_zone(segments: list):
+    if len(segments) < 2:
+        return None
+    for i in range(len(segments) - 2, -1, -1):
+        if segments[i]["zone"] in (LOW, HIGH):
+            return segments[i]["zone"]
+    return None
+
+
+def _compute_extremum(history: list, segments: list, zone_type: str):
+    rsi_values = []
+    for seg in segments:
+        if seg["zone"] == zone_type:
+            for idx in range(seg["start"], seg["end"] + 1):
+                rsi_values.append(history[idx][1])
+    if not rsi_values:
+        return None
+    if zone_type == LOW:
+        return min(rsi_values)
+    if zone_type == HIGH:
+        return max(rsi_values)
+    return None
+
+
 def _derive_state(history: list, cfg: dict) -> dict:
     """history is oldest→newest list of (close_time_iso, rsi)."""
     if not history:
@@ -64,103 +130,45 @@ def _derive_state(history: list, cfg: dict) -> dict:
 
     sustain_n = cfg["sustain"]
     zones = [_classify(rsi, cfg) for _, rsi in history]
-    latest_zone = zones[-1]
-    latest_ct, latest_rsi = history[-1]
+    segments = _build_segments(zones)
+    failed_bottom, failed_top = _count_failed_attempts(segments)
 
-    # Find most recent zone transition (point where zone changes).
-    # Walk backward looking for first index where zones[i] != zones[i+1].
-    transition_idx = None  # index of the candle BEFORE the transition
-    for i in range(len(zones) - 2, -1, -1):
-        if zones[i] != zones[i + 1]:
-            transition_idx = i
-            break
+    last_seg = segments[-1]
+    latest_zone = last_seg["zone"]
+    source_zone = _find_source_zone(segments)
 
-    if transition_idx is None:
-        # Whole window is one zone (no transition seen).
-        if latest_zone == LOW:
-            state = "LOW_ZONE"
-            zone_entered_at = history[0][0]
-            zone_exited_at = None
-            sustain = len(history)
-            extremum = min(r for _, r in history)
-        elif latest_zone == HIGH:
-            state = "HIGH_ZONE"
-            zone_entered_at = history[0][0]
-            zone_exited_at = None
-            sustain = len(history)
-            extremum = max(r for _, r in history)
-        else:
-            state = "RANGE"
-            zone_entered_at = None
-            zone_exited_at = None
-            sustain = len(history)
-            extremum = None
-        return {
-            "state": state,
-            "zone_entered_at": zone_entered_at,
-            "zone_exited_at": zone_exited_at,
-            "sustain_candles_count": sustain,
-            "failed_attempts_count": 0,
-            "last_zone_extremum": extremum,
-        }
+    state = "RANGE"
+    zone_entered_at = None
+    zone_exited_at = None
+    sustain = last_seg["length"]
+    failed = 0
+    extremum = None
 
-    prev_zone = zones[transition_idx]       # zone before the transition
-    curr_zone = zones[transition_idx + 1]   # zone the latest run started in
-    transition_ct = history[transition_idx + 1][0]
-
-    # Sustain = how many closes since the transition (including transition candle).
-    sustain = len(zones) - (transition_idx + 1)
-
-    # Count failed re-entries: times zone flipped back into prev_zone within window.
-    failed = sum(
-        1
-        for i in range(transition_idx + 1, len(zones))
-        if zones[i] == prev_zone
-    )
-
-    # Last extremum inside previous zone spell.
-    prev_zone_rsis = [history[i][1] for i in range(transition_idx + 1) if zones[i] == prev_zone]
-    if prev_zone == LOW and prev_zone_rsis:
-        extremum = min(prev_zone_rsis)
-    elif prev_zone == HIGH and prev_zone_rsis:
-        extremum = max(prev_zone_rsis)
-    else:
-        extremum = None
-
-    # Map to final state.
     if latest_zone == LOW:
-        # Currently back in LOW after having been elsewhere — failed bottom if
-        # the prior excursion exited LOW recently; else fresh LOW_ZONE.
-        if prev_zone == LOW:
-            state = "FAILED_BOTTOM"
-        else:
-            state = "LOW_ZONE"
-        zone_entered_at = transition_ct if curr_zone == LOW else history[-1][0]
-        zone_exited_at = None
+        zone_entered_at = history[last_seg["start"]][0]
+        extremum = _compute_extremum(history, segments, LOW)
+        failed = failed_bottom
+        state = "FAILED_BOTTOM" if failed_bottom > 0 else "LOW_ZONE"
+
     elif latest_zone == HIGH:
-        if prev_zone == HIGH:
-            state = "FAILED_TOP"
-        else:
-            state = "HIGH_ZONE"
-        zone_entered_at = transition_ct if curr_zone == HIGH else history[-1][0]
-        zone_exited_at = None
-    else:  # latest_zone == MID
-        if prev_zone == LOW:
-            if sustain >= sustain_n:
-                state = "CONFIRMED_BULL"
-            else:
-                state = "EXITING_LOW"
-            zone_exited_at = transition_ct
-        elif prev_zone == HIGH:
-            if sustain >= sustain_n:
-                state = "CONFIRMED_BEAR"
-            else:
-                state = "EXITING_HIGH"
-            zone_exited_at = transition_ct
+        zone_entered_at = history[last_seg["start"]][0]
+        extremum = _compute_extremum(history, segments, HIGH)
+        failed = failed_top
+        state = "FAILED_TOP" if failed_top > 0 else "HIGH_ZONE"
+
+    else:  # MID
+        if source_zone == LOW:
+            zone_exited_at = history[last_seg["start"]][0]
+            extremum = _compute_extremum(history, segments, LOW)
+            failed = failed_bottom
+            state = "CONFIRMED_BULL" if sustain >= sustain_n else "EXITING_LOW"
+        elif source_zone == HIGH:
+            zone_exited_at = history[last_seg["start"]][0]
+            extremum = _compute_extremum(history, segments, HIGH)
+            failed = failed_top
+            state = "CONFIRMED_BEAR" if sustain >= sustain_n else "EXITING_HIGH"
         else:
             state = "RANGE"
-            zone_exited_at = None
-        zone_entered_at = None
 
     return {
         "state": state,
