@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(python -c \"import ast; ast.parse\\(open\\('src/backfill_eod.py'\\).read\\(\\)\\); ast.parse\\(open\\('src/api/routes/analytics.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
-      "Bash(python -m py_compile \"E:\\\\tele_agent\\\\Telethon\\\\src\\\\api\\\\routes\\\\analytics.py\")"
+      "Bash(python -m py_compile \"E:\\\\tele_agent\\\\Telethon\\\\src\\\\api\\\\routes\\\\analytics.py\")",
+      "Bash(python -m py_compile src/portflow/db.py src/portflow/ta_engine.py src/portflow/state_engine.py src/portflow/badges.py src/portflow/router.py src/listener.py)"
     ]
   }
 }

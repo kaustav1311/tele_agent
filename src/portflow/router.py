@@ -10,7 +10,9 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
+from src.portflow.badges import compute_badges_for_ticker
 from src.portflow.db import get_portflow_conn
+from src.portflow.state_engine import refresh_all_states, refresh_states_for_ticker
 from src.portflow.ta_engine import TIMEFRAMES, bootstrap_ticker
 
 logger = logging.getLogger(__name__)
@@ -63,7 +65,7 @@ def _ta_map_for_ticker(conn: sqlite3.Connection, ticker: str) -> dict:
     return {tf: by_tf.get(tf) for tf in TIMEFRAMES}
 
 
-def _ticker_row_to_dict(row: sqlite3.Row, ta: dict) -> dict:
+def _ticker_row_to_dict(row: sqlite3.Row, ta: dict, badges: Optional[dict] = None) -> dict:
     return {
         "id": row["id"],
         "watchlist_id": row["watchlist_id"],
@@ -74,6 +76,7 @@ def _ticker_row_to_dict(row: sqlite3.Row, ta: dict) -> dict:
         "image": row["image"],
         "added_at": row["added_at"],
         "ta": ta,
+        "badges": badges,
     }
 
 
@@ -171,6 +174,12 @@ def delete_watchlist(watchlist_id: int):
                     conn.execute(
                         "DELETE FROM watchlist_ta_cache WHERE ticker = ?", (t,)
                     )
+                    conn.execute(
+                        "DELETE FROM watchlist_rsi_history WHERE ticker = ?", (t,)
+                    )
+                    conn.execute(
+                        "DELETE FROM watchlist_rsi_state WHERE ticker = ?", (t,)
+                    )
             conn.commit()
         except sqlite3.Error as e:
             conn.rollback()
@@ -204,7 +213,11 @@ def list_tickers(watchlist_id: int):
         ).fetchall()
 
         return [
-            _ticker_row_to_dict(r, _ta_map_for_ticker(conn, r["ticker"]))
+            _ticker_row_to_dict(
+                r,
+                _ta_map_for_ticker(conn, r["ticker"]),
+                compute_badges_for_ticker(r["ticker"]),
+            )
             for r in rows
         ]
     finally:
@@ -260,7 +273,15 @@ def add_ticker(watchlist_id: int, body: TickerCreate):
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=500, detail="failed to read inserted ticker")
-        return _ticker_row_to_dict(row, _ta_map_for_ticker(conn, ticker))
+        try:
+            refresh_states_for_ticker(ticker)
+        except Exception as e:
+            logger.exception("refresh_states_for_ticker failed for %s: %s", ticker, e)
+        return _ticker_row_to_dict(
+            row,
+            _ta_map_for_ticker(conn, ticker),
+            compute_badges_for_ticker(ticker),
+        )
     finally:
         conn.close()
 
@@ -287,6 +308,12 @@ def delete_ticker(watchlist_id: int, ticker: str):
                 conn.execute(
                     "DELETE FROM watchlist_ta_cache WHERE ticker = ?", (ticker,)
                 )
+                conn.execute(
+                    "DELETE FROM watchlist_rsi_history WHERE ticker = ?", (ticker,)
+                )
+                conn.execute(
+                    "DELETE FROM watchlist_rsi_state WHERE ticker = ?", (ticker,)
+                )
             conn.commit()
         except sqlite3.Error as e:
             conn.rollback()
@@ -301,6 +328,11 @@ def delete_ticker(watchlist_id: int, ticker: str):
 # ---------------------------------------------------------------------------
 # TA status
 # ---------------------------------------------------------------------------
+
+@router.post("/ta/refresh-states")
+def ta_refresh_states():
+    return refresh_all_states()
+
 
 @router.get("/ta/status")
 def ta_status():

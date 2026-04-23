@@ -43,6 +43,31 @@ def init_portflow_db() -> None:
         """)
 
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS watchlist_rsi_history (
+                ticker              TEXT NOT NULL,
+                timeframe           TEXT NOT NULL,
+                candle_close_time   TEXT NOT NULL,
+                rsi_value           REAL NOT NULL,
+                PRIMARY KEY (ticker, timeframe, candle_close_time)
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS watchlist_rsi_state (
+                ticker                  TEXT NOT NULL,
+                timeframe               TEXT NOT NULL,
+                state                   TEXT NOT NULL,
+                zone_entered_at         TEXT,
+                zone_exited_at          TEXT,
+                sustain_candles_count   INTEGER DEFAULT 0,
+                failed_attempts_count   INTEGER DEFAULT 0,
+                last_zone_extremum      REAL,
+                updated_at              TEXT NOT NULL,
+                PRIMARY KEY (ticker, timeframe)
+            )
+        """)
+
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS watchlist_ta_cache (
                 ticker          TEXT NOT NULL,
                 timeframe       TEXT NOT NULL,

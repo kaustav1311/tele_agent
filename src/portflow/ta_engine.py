@@ -18,9 +18,18 @@ from src.portflow.db import get_portflow_conn
 
 logger = logging.getLogger(__name__)
 
-TIMEFRAMES = ["15m", "1h", "4h", "1d"]
+TIMEFRAMES = ["15m", "1h", "4h", "1d", "1w"]
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 KLINE_LIMIT = 40
+RSI_HISTORY_CANDLES = 10
+
+
+def _kline_limit(tf: str) -> int:
+    if tf == "1d":
+        return 220
+    if tf == "1w":
+        return 30
+    return KLINE_LIMIT
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 EMA_PERIODS = [20, 50, 200]
@@ -110,6 +119,7 @@ def compute_ta(df: pd.DataFrame, timeframe: str) -> dict:
         "atr_pct": None,
         "ema_stack": None,
         "vol_ratio": None,
+        "rsi_history": [],
     }
 
     rsi_series = RSIIndicator(close=df["close"], window=RSI_PERIOD, fillna=False).rsi()
@@ -121,6 +131,22 @@ def compute_ta(df: pd.DataFrame, timeframe: str) -> dict:
         out["rsi_prev1"] = _round(rsi_prev1)
         out["rsi_prev2"] = _round(rsi_prev2)
         out["rsi_direction"] = derive_rsi_direction(rsi, rsi_prev1, rsi_prev2)
+
+        # Last N closed-candle RSI values. Binance's final row is typically the
+        # currently forming candle; skip it with iloc[-(N+1):-1].
+        now_ms = int(datetime.utcnow().timestamp() * 1000)
+        history = []
+        window = df.iloc[-(RSI_HISTORY_CANDLES + 1):-1]
+        for idx, row in window.iterrows():
+            close_time_ms = int(row["close_time"])
+            if close_time_ms > now_ms:
+                continue  # safety: candle still forming
+            rsi_val = rsi_series.iloc[idx] if idx in rsi_series.index else None
+            if rsi_val is None or rsi_val != rsi_val:  # NaN
+                continue
+            close_iso = datetime.utcfromtimestamp(close_time_ms / 1000).isoformat() + "Z"
+            history.append((close_iso, round(float(rsi_val), 4)))
+        out["rsi_history"] = history
 
     if timeframe in ("1h", "1d"):
         atr_series = AverageTrueRange(
@@ -190,6 +216,24 @@ def upsert_ta_cache(ticker: str, timeframe: str, ta: dict) -> None:
         conn.close()
 
 
+def upsert_rsi_history(ticker: str, timeframe: str, pairs: list) -> None:
+    if not pairs:
+        return
+    conn = get_portflow_conn()
+    try:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO watchlist_rsi_history
+                (ticker, timeframe, candle_close_time, rsi_value)
+            VALUES (?, ?, ?, ?)
+            """,
+            [(ticker, timeframe, ct, rv) for ct, rv in pairs],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _unsupported_payload() -> dict:
     return {
         "rsi": None,
@@ -200,6 +244,7 @@ def _unsupported_payload() -> dict:
         "atr_pct": None,
         "ema_stack": None,
         "vol_ratio": None,
+        "rsi_history": [],
     }
 
 
@@ -212,14 +257,14 @@ def bootstrap_ticker(ticker: str) -> dict:
             upsert_ta_cache(ticker, timeframe, _unsupported_payload())
             continue
 
-        limit = 220 if timeframe == "1d" else KLINE_LIMIT
-        df, _ = fetch_klines(symbol, timeframe, limit)
+        df, _ = fetch_klines(symbol, timeframe, _kline_limit(timeframe))
         if df is None:
             upsert_ta_cache(ticker, timeframe, _unsupported_payload())
             continue
 
         ta = compute_ta(df, timeframe)
         upsert_ta_cache(ticker, timeframe, ta)
+        upsert_rsi_history(ticker, timeframe, ta.get("rsi_history", []))
         time.sleep(0.06)
 
     logger.info("Bootstrapped TA cache for %s", ticker)
@@ -249,14 +294,14 @@ def refresh_all_tickers() -> dict:
                 stopped_early = True
                 break
 
-            limit = 220 if timeframe == "1d" else KLINE_LIMIT
-            df, weight = fetch_klines(symbol, timeframe, limit)
+            df, weight = fetch_klines(symbol, timeframe, _kline_limit(timeframe))
             weight_budget += weight
             if df is None:
                 continue
 
             ta = compute_ta(df, timeframe)
             upsert_ta_cache(ticker, timeframe, ta)
+            upsert_rsi_history(ticker, timeframe, ta.get("rsi_history", []))
             time.sleep(0.05)
 
         if stopped_early:
