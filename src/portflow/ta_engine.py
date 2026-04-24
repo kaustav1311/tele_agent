@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 TIMEFRAMES = ["15m", "1h", "4h", "1d", "1w"]
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 KLINE_LIMIT = 40
-RSI_HISTORY_CANDLES = 10
+RSI_HISTORY_CANDLES = {"1w": 10, "1d": 30, "1h": 20, "15m": 10, "4h": 10}
 
 
 def _kline_limit(tf: str) -> int:
@@ -29,6 +29,12 @@ def _kline_limit(tf: str) -> int:
         return 220
     if tf == "1w":
         return 30
+    if tf == "1h":
+        return 60
+    if tf == "15m":
+        # Binance pre-announces ~96 future 15m candles (24h × 4).
+        # Fetching 200 guarantees at least 100 past closed candles after filtering.
+        return 200
     return KLINE_LIMIT
 RSI_PERIOD = 14
 ATR_PERIOD = 14
@@ -132,21 +138,25 @@ def compute_ta(df: pd.DataFrame, timeframe: str) -> dict:
         out["rsi_prev2"] = _round(rsi_prev2)
         out["rsi_direction"] = derive_rsi_direction(rsi, rsi_prev1, rsi_prev2)
 
-        # Last N closed-candle RSI values. Binance's final row is typically the
-        # currently forming candle; skip it with iloc[-(N+1):-1].
+        # Last N closed-candle RSI values.
+        # Binance pre-announces future candles at the tail of every klines response
+        # (up to ~7 hours worth, proportionally more for shorter timeframes).
+        # Scanning the entire df and filtering by close_time > now_ms is the only
+        # reliable way to discard every forming/future candle regardless of how many
+        # Binance appends. We then take exactly the last N valid closed candles.
+        n_history = RSI_HISTORY_CANDLES.get(timeframe, 10)
         now_ms = int(datetime.utcnow().timestamp() * 1000)
         history = []
-        window = df.iloc[-(RSI_HISTORY_CANDLES + 1):-1]
-        for idx, row in window.iterrows():
+        for idx, row in df.iterrows():
             close_time_ms = int(row["close_time"])
             if close_time_ms > now_ms:
-                continue  # safety: candle still forming
+                continue  # candle still forming or future placeholder — skip
             rsi_val = rsi_series.iloc[idx] if idx in rsi_series.index else None
-            if rsi_val is None or rsi_val != rsi_val:  # NaN
+            if rsi_val is None or rsi_val != rsi_val:  # NaN (RSI warmup period)
                 continue
             close_iso = datetime.utcfromtimestamp(close_time_ms / 1000).isoformat() + "Z"
             history.append((close_iso, round(float(rsi_val), 4)))
-        out["rsi_history"] = history
+        out["rsi_history"] = history[-n_history:]  # keep exactly the last N closes
 
     if timeframe in ("1h", "1d"):
         atr_series = AverageTrueRange(
@@ -219,6 +229,7 @@ def upsert_ta_cache(ticker: str, timeframe: str, ta: dict) -> None:
 def upsert_rsi_history(ticker: str, timeframe: str, pairs: list) -> None:
     if not pairs:
         return
+    n_keep = RSI_HISTORY_CANDLES.get(timeframe, 10)
     conn = get_portflow_conn()
     try:
         conn.executemany(
@@ -228,6 +239,21 @@ def upsert_rsi_history(ticker: str, timeframe: str, pairs: list) -> None:
             VALUES (?, ?, ?, ?)
             """,
             [(ticker, timeframe, ct, rv) for ct, rv in pairs],
+        )
+        # Trim rows older than the N most recent closes for this (ticker, timeframe).
+        conn.execute(
+            """
+            DELETE FROM watchlist_rsi_history
+            WHERE ticker = ? AND timeframe = ?
+              AND candle_close_time NOT IN (
+                  SELECT candle_close_time
+                  FROM watchlist_rsi_history
+                  WHERE ticker = ? AND timeframe = ?
+                  ORDER BY candle_close_time DESC
+                  LIMIT ?
+              )
+            """,
+            (ticker, timeframe, ticker, timeframe, n_keep),
         )
         conn.commit()
     finally:
